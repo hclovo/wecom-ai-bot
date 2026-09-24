@@ -1,0 +1,19 @@
+{
+  "name": "wecom-ai-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "微信客服 + 火山方舟 GLM 的微信聊天 AI bot",
+  "scripts": {
+    "start": "node server.ts",
+    "test": "node --test test/",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=23.6"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "typescript": "^7.0.2"
+  }
+}
