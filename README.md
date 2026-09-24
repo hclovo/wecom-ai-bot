@@ -58,7 +58,13 @@
 
 ```bash
 cp .env.example .env   # 填好所有配置
-npm start              # 运行时零依赖，无需 npm install；npm install 仅类型检查时需要
+npm start              # 运行时零依赖，无需 npm install（需要 Node ≥ 23.6）
+```
+
+或用 Docker（服务器部署推荐，完整流程见 DEPLOY.md）：
+
+```bash
+docker compose up -d --build
 ```
 
 服务默认监听 `:8788`，回调路径为 `/webhook`。

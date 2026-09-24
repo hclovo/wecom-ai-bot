@@ -17,6 +17,8 @@
 
 ## 2. 服务器初始化
 
+> **走 Docker 路线（推荐，见第 5.1 节）**：只需安装 Docker 本身，可跳过 2.1（Node 安装）和 2.2（专用用户，容器内已用非 root 运行），目录随便放。
+
 ### 2.1 安装 Node 24 LTS
 
 项目零运行时依赖，只需 Node 本体。要求 Node ≥ 23.6（原生 type stripping，可直接运行 `.ts`，无需编译），建议装 Node 24 LTS。用 NodeSource 安装：
@@ -124,7 +126,42 @@ sudo chmod 600 /opt/wecom-ai-bot/.env
 sudo chown wecomb:wecomb /opt/wecom-ai-bot/.env
 ```
 
-## 5. 用 systemd 守护
+## 5. 守护进程
+
+### 5.1 Docker Compose（推荐）
+
+项目自带 `Dockerfile`（node:24-alpine 基础镜像、非 root 运行、自带 /healthz 探活）和 `compose.yaml`（`restart: unless-stopped`，随 Docker 服务开机自启）。配置从同目录 `.env` 注入，**不会打进镜像**。
+
+安装 Docker（如尚未安装）：
+
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo systemctl enable --now docker
+```
+
+构建镜像并启动：
+
+```bash
+cd /opt/wecom-ai-bot        # 第 4 步的 .env 已就位于此
+sudo docker compose up -d --build
+```
+
+常用运维命令：
+
+```bash
+sudo docker compose ps          # 运行状态
+sudo docker compose logs -f     # 实时跟踪日志
+sudo docker compose restart     # 重启
+sudo docker compose down        # 停止并移除容器
+```
+
+本机自测：
+
+```bash
+curl http://127.0.0.1:8788/healthz    # 应返回 ok（容器内 HEALTHCHECK 也在自动探活）
+```
+
+### 5.2 systemd（不用 Docker 的备选）
 
 创建服务文件：
 
@@ -250,7 +287,7 @@ https://你的域名/webhook
 
 1. **配置接收消息回调**：
    - URL 填 `https://你的域名/webhook`（或路线 B 的 `http://IP:8788/webhook`）；
-   - Token、EncodingAESKey 填与 `.env` 中完全一致的值（若后台随机生成了一版，反过来把后台的值复制进 `.env` 再 `sudo systemctl restart wecom-ai-bot` 也可以）；
+   - Token、EncodingAESKey 填与 `.env` 中完全一致的值（若后台随机生成了一版，反过来把后台的值复制进 `.env`，再执行 `sudo docker compose restart`（Docker）或 `sudo systemctl restart wecom-ai-bot`（systemd）也可以）；
    - 点「保存/验证」，企业微信会向 URL 发一条加密的验证请求，本服务解密 echostr 并回传，通过即配置成功。
 2. **接待方式**：进入客服账号详情，把接待方式设为「**回调/API 接入**」，否则消息会进人工接待队列，AI 不会回复。
 3. **可信 IP**：在该 Secret 的「企业可信 IP」配置里，填入**服务器的公网 IP**（不是内网 IP）。不填的话服务调用微信客服 API 会报 `errcode 60020`。服务器公网 IP 可用下面命令确认：
@@ -264,23 +301,34 @@ https://你的域名/webhook
 按顺序逐项确认：
 
 - [ ] `curl http://127.0.0.1:8788/healthz` 在服务器本机返回 `ok`
-- [ ] `sudo systemctl status wecom-ai-bot` 显示 `active (running)`，且 `Restart=always` 生效（`systemctl is-enabled wecom-ai-bot` 返回 `enabled`）
+- [ ] 守护进程在运行：Docker 路线 `sudo docker compose ps` 显示 `Up`（`docker inspect --format '{{.State.Health.Status}}' wecom-ai-bot` 为 `healthy`）；systemd 路线 `systemctl status wecom-ai-bot` 显示 `active (running)` 且 `is-enabled` 为 `enabled`
 - [ ] 外网可达：本地电脑执行 `curl https://你的域名/healthz`（路线 B 则为 `curl http://IP:8788/healthz`）返回 `ok`
 - [ ] 企业微信后台回调配置「验证」通过（保存时不报 URL/Token 错误）
-- [ ] `journalctl -u wecom-ai-bot -f` 中能看到企业微信回调请求进来
+- [ ] `sudo docker compose logs -f`（Docker）或 `journalctl -u wecom-ai-bot -f`（systemd）中能看到企业微信回调请求进来
 - [ ] 用自己的微信扫客服二维码，发一条文本消息，几秒内收到 AI 回复
 - [ ] （可选）发一张图片、一个 PDF，确认多模态与文档链路正常
 
 ## 9. 更新发布流程
 
+**Docker 路线：**
+
 ```bash
 cd /opt/wecom-ai-bot
-sudo -u wecomb git pull          # scp 方式部署的则重新 scp 覆盖
-sudo systemctl restart wecom-ai-bot
-journalctl -u wecom-ai-bot -f    # 确认启动无报错、回调正常进入
+sudo git pull                          # scp 方式部署的则重新 scp 覆盖
+sudo docker compose up -d --build      # 重新构建镜像并滚动替换容器
+sudo docker compose logs -f            # 确认启动无报错、回调正常进入
 ```
 
-零依赖、无构建步骤，restart 即生效。注意：会话上下文存内存，重启会清空（见 README「已知边界」），发布窗口避开有人正在对话即可。
+**systemd 路线：**
+
+```bash
+cd /opt/wecom-ai-bot
+sudo -u wecomb git pull
+sudo systemctl restart wecom-ai-bot
+journalctl -u wecom-ai-bot -f
+```
+
+零依赖、无构建步骤（Docker 构建也只是拷文件），restart 即生效。注意：会话上下文存内存，重启会清空（见 README「已知边界」），发布窗口避开有人正在对话即可。
 
 ## 10. 常见故障排查
 
@@ -289,8 +337,8 @@ journalctl -u wecom-ai-bot -f    # 确认启动无报错、回调正常进入
 | 日志报 `errcode 60020` | 未配置服务器「可信 IP」：管理后台该 Secret 的「企业可信 IP」加上服务器**公网 IP**（`curl -s ifconfig.me` 确认），保存后无需重启服务 |
 | 回调验证失败 / `errcode 40029` / 验签失败 | `.env` 里的 `WECOM_TOKEN`、`WECOM_ENCODING_AES_KEY` 与企业微信后台配置不一致；改完任一侧后需重启服务并重试验证。若仍失败，确认 `WECOM_CORP_ID` 正确（解密校验 receiveId 用） |
 | 公网访问不通 / 回调超时 | 云**安全组**未放行 80/443（路线 A）或 8788（路线 B）；服务器本机 ufw 未放行；nginx 未启动或 `nginx -t` 报错。逐步排查：本机 `/healthz` → 公网 `curl /healthz` → 后台验证 |
-| 服务起了但马上退出 | `journalctl -u wecom-ai-bot -n 50` 看报错；常见为 `.env` 缺项、权限不对（.env 非 wecomb 可读）、node 路径写错 |
+| 服务起了但马上退出 | Docker 路线 `sudo docker compose logs --since 5m`、systemd 路线 `journalctl -u wecom-ai-bot -n 50` 看报错；常见为 `.env` 缺项（容器日志会打印「缺少配置: …」）、`.env` 不在 compose.yaml 同目录 |
 | 回调验证通过但收不到消息 | 客服账号的**接待方式**未设为「回调/API 接入」，消息进了人工队列；或 `.env` 里 `WECOM_OPEN_KFID` 过滤掉了该客服账号 |
-| 收到消息但没回复 | 看 `journalctl -u wecom-ai-bot -f` 里 sync_msg / llm 的报错；LLM 401/404 多为 API Key、`LLM_BASE_URL`、`LLM_MODEL` 配置错误 |
+| 收到消息但没回复 | 看 `docker compose logs -f`（Docker）或 `journalctl -f`（systemd）里 sync_msg / llm 的报错；LLM 401/404 多为 API Key、`LLM_BASE_URL`、`LLM_MODEL` 配置错误 |
 | 回复延迟数秒 | 正常现象：链路是「回调通知 → sync_msg 拉取 → 调模型 → send_msg 补发」的异步流程（见 README「常见问题」），几秒内属正常范围 |
 | 证书到期回调失败 | certbot 自动续期失败，手动 `sudo certbot renew` 并确认 80 端口安全组放行 |
