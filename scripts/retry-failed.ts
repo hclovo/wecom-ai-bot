@@ -1,12 +1,13 @@
-import { DatabaseSync } from 'node:sqlite';
+import { MessageStore, databaseConfig } from '../lib/message-store.ts';
 import { loadEnvFile } from '../server.ts';
 loadEnvFile(new URL('../.env', import.meta.url).pathname);
-const id = Number(process.argv[2]);
-if (!Number.isSafeInteger(id) || id < 1) throw new Error('用法: node scripts/retry-failed.ts <任务ID>');
-// Do not instantiate MessageStore: recovery of processing jobs belongs only to server startup.
-const db = new DatabaseSync(process.env.SQLITE_PATH || './data/bot.sqlite');
-try {
-  db.exec('PRAGMA busy_timeout=5000;');
-  const result = db.prepare("UPDATE inbox SET status='reply_ready',attempts=0,next_at=0 WHERE id=? AND status='failed'").run(id);
-  console.log(`重新排队任务数: ${result.changes}`);
-} finally { db.close(); }
+const id = process.argv[2] || '';
+if (!/^[1-9][0-9]*$/.test(id) || BigInt(id) > 9223372036854775807n) {
+  console.error('用法: node scripts/retry-failed.ts <任务ID>'); process.exitCode = 1;
+} else {
+  try {
+    const store = await MessageStore.open(databaseConfig(), 'admin');
+    try { console.log(`重新排队任务数: ${await store.retryFailed(id)}`); }
+    finally { await store.close(); }
+  } catch { console.error('无法重发：请检查数据库连接和 schema 版本'); process.exitCode = 1; }
+}

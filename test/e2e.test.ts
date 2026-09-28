@@ -1,3 +1,4 @@
+import { databaseEnv } from './database.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -61,7 +62,7 @@ function envFromCfg(): Record<string, string> {
     LLM_MODEL: CFG.llmModel,
     LLM_SYSTEM_PROMPT: CFG.systemPrompt,
     PORT: String(CFG.port),
-    SQLITE_PATH: ':memory:',
+    ...databaseEnv(),
     RETRY_BASE_MS: '10',
   };
 }
@@ -200,7 +201,7 @@ async function startStack(calls: Calls, state: StackState): Promise<{ stop: () =
   clearTokenCache();
   const wecomMock = mockWecom(calls, state);
   const arkMock = mockArk(calls);
-  const bot = createServer(loadConfig(envFromCfg()));
+  const bot = await createServer(loadConfig(envFromCfg()));
   await Promise.all([[wecomMock, 18789], [arkMock, 18790], [bot, CFG.port]].map(([server, port]) =>
     new Promise<void>((resolve, reject) => (server as http.Server).once('error', reject).listen(port as number, '127.0.0.1', resolve))));
   const stop = async () => {

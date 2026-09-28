@@ -1,0 +1,26 @@
+# 可选：在同一服务器运行 PostgreSQL，不对公网映射数据库端口。
+# docker compose -f compose.yaml -f compose.postgres.yaml up -d --build
+services:
+  wecom-ai-bot:
+    environment:
+      DATABASE_URL: "postgresql://wecom_bot:${POSTGRES_PASSWORD:?请在.env中设置随机十六进制POSTGRES_PASSWORD}@postgres:5432/wecom_bot"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wecom_bot
+      POSTGRES_DB: wecom_bot
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?请在.env中设置随机十六进制POSTGRES_PASSWORD}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wecom_bot -d wecom_bot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    stop_grace_period: 30s
+volumes:
+  postgres-data:

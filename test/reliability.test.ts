@@ -1,8 +1,6 @@
+import { testDatabase, databaseEnv } from './database.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { MessageStore } from '../lib/message-store.ts';
 import { MessageWorker } from '../lib/message-worker.ts';
@@ -15,24 +13,25 @@ import { encrypt, sha1Signature } from '../lib/wecom-crypto.ts';
 const cfg = loadConfig({ WECOM_CORP_ID: 'corp', WECOM_KF_SECRET: 'SECRET', WECOM_TOKEN: 'token',
   WECOM_ENCODING_AES_KEY: Buffer.alloc(32, 1).toString('base64').slice(0,43),
   WECOM_OPEN_KFID: 'kf', LLM_BASE_URL: 'https://mock', LLM_API_KEY: 'LLM_SECRET', LLM_MODEL: 'model',
-  SQLITE_PATH: ':memory:', RETRY_BASE_MS: '10', UPSTREAM_TIMEOUT_MS: '100', SYNC_POLL_MS: '60000', MAX_HISTORY_TURNS: '2',
+  ...databaseEnv(), RETRY_BASE_MS: '10', UPSTREAM_TIMEOUT_MS: '100', SYNC_POLL_MS: '60000', MAX_HISTORY_TURNS: '2',
 });
 const msg = (id: string, user = 'user', content = 'hello') => ({ msgid: id, external_userid: user, origin: 3, msgtype: 'text', text: { content } });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-async function until(cond: () => boolean, ms = 3000) {
+async function until(cond: () => boolean | Promise<boolean>, ms = 3000) {
   const end = Date.now() + ms;
-  while (!cond()) { if (Date.now() > end) throw new Error('condition timed out'); await sleep(10); }
+  while (!(await cond())) { if (Date.now() > end) throw new Error('condition timed out'); await sleep(10); }
 }
-function add(store: MessageStore, messages = [msg('one')], cursor = 'next') {
-  store.notify('kf'); const job = store.syncReady()!; store.acceptPage(job, messages, cursor, false, 100);
+async function add(store: MessageStore, messages = [msg('one')], cursor = 'next') {
+  await store.notify('kf'); const job = (await store.syncReady())!; await store.acceptPage(job, messages, cursor, false, 100);
 }
-function callback(bot: ReturnType<typeof createServer>, receiver = cfg.corpId, kfid = 'kf', bodyOverride?: string): number {
+async function callback(bot: Awaited<ReturnType<typeof createServer>>, receiver = cfg.corpId, kfid = 'kf', bodyOverride?: string): Promise<number> {
   const encrypted = encrypt(`<xml><Event>kf_msg_or_event</Event><OpenKfId>${kfid}</OpenKfId><Token>cb</Token></xml>`, cfg.aesKey, receiver);
   const req = Object.assign(new EventEmitter(), { method: 'POST', url: '/webhook?timestamp=1&nonce=n&msg_signature='+sha1Signature(cfg.token,'1','n',encrypted) });
-  const res = { status: 0, writeHead(n: number) { this.status=n; return this; }, end() {} };
+  let complete!: () => void; const ended = new Promise<void>((r) => { complete = r; });
+  const res = { status: 0, headersSent: false, writeHead(n: number) { this.status=n; this.headersSent=true; return this; }, end() { complete(); } };
   bot.emit('request', req, res);
   req.emit('data', Buffer.from(bodyOverride ?? `<xml><Encrypt>${encrypted}</Encrypt></xml>`)); req.emit('end');
-  return res.status;
+  await ended; return res.status;
 }
 
 test('Unicode reply chunks preserve input and obey UTF-8 byte budget', () => {
@@ -69,37 +68,37 @@ test('download limit stops stream and file polling fails promptly on authenticat
 });
 
 test('POST rejects wrong receiver, filters accounts and bounds request body', async () => {
-  const bot = createServer(cfg);
+  const bot = await createServer({...cfg,...testDatabase()});
   try {
-    assert.equal(callback(bot, 'wrong'), 401);
-    assert.equal(callback(bot, cfg.corpId, 'other'), 200);
-    assert.equal(bot.worker.store.syncReady(), undefined);
-    assert.equal(callback(bot, cfg.corpId, 'kf', 'x'.repeat(65537)), 413);
-    assert.equal(bot.worker.store.syncReady(), undefined);
+    assert.equal(await callback(bot, 'wrong'), 401);
+    assert.equal(await callback(bot, cfg.corpId, 'other'), 200);
+    assert.equal(await bot.worker.store.syncReady(), undefined);
+    assert.equal(await callback(bot, cfg.corpId, 'kf', 'x'.repeat(65537)), 413);
+    assert.equal(await bot.worker.store.syncReady(), undefined);
   } finally { await bot.stopWorker(); }
 });
 
-test('inbox, cursor, quota and partial outbox survive restart; capacity rollback is atomic', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'wecom-store-')); const path = join(dir,'bot.sqlite');
-  let store = new MessageStore(path);
+test('inbox, cursor, quota and partial outbox survive restart; capacity rollback is atomic', async () => {
+  const dbConfig = testDatabase();
+  let store = await MessageStore.open(dbConfig);
   try {
-    add(store); const job = store.nextJobs(1)[0];
-    assert.equal(store.charge(job, 1, '2026-09-28'), true);
-    store.start(job);
-    store.saveReply(job, 'saved-session', ['first', 'second']); store.markPart(job, 0);
-    const stableId = store.parts(job)[0].msgid;
-    store.close(); store = new MessageStore(path);
-    assert.equal(store.session(job.user_key), 'saved-session');
-    assert.equal(store.parts(job).length, 1); assert.equal(store.parts(job)[0].msgid, stableId);
-    assert.equal(store.charge(job, 1, '2026-09-28'), true);
-    add(store, [msg('one'),msg('two')]); // duplicate first is ignored
-    assert.equal(store.pendingCount(), 2);
-    store.notify('kf'); const sync = store.syncReady()!;
-    assert.throws(() => store.acceptPage(sync,[msg('three')],'bad-cursor',false,2), /QUEUE_FULL/);
-    assert.equal(store.syncReady()!.cursor,'next'); assert.equal(store.pendingCount(),2);
-    store.done(job);
-    assert.equal(store.charge(store.nextJobs(1)[0],1,'2026-09-28'),false);
-  } finally { store.close(); rmSync(dir,{recursive:true,force:true}); }
+    await add(store); const job = (await store.nextJobs(1))[0];
+    assert.equal(await store.charge(job, 1, '2026-09-28'), true);
+    await store.start(job);
+    await store.saveReply(job, 'saved-session', ['first', 'second']); await store.markPart(job, 0);
+    const stableId = (await store.parts(job))[0].msgid;
+    await store.close(); store = await MessageStore.open(dbConfig);
+    assert.equal(await store.session(job.user_key), 'saved-session');
+    assert.equal((await store.parts(job)).length, 1); assert.equal((await store.parts(job))[0].msgid, stableId);
+    assert.equal(await store.charge(job, 1, '2026-09-28'), true);
+    await add(store, [msg('one'),msg('two')]); // duplicate first is ignored
+    assert.equal((await store.pendingCount()), 2);
+    await store.notify('kf'); const sync = (await store.syncReady())!;
+    await assert.rejects(() => store.acceptPage(sync,[msg('three')],'bad-cursor',false,2), /QUEUE_FULL/);
+    assert.equal((await store.syncReady())!.cursor,'next'); assert.equal((await store.pendingCount()),2);
+    await store.done(job);
+    assert.equal(await store.charge((await store.nextJobs(1))[0],1,'2026-09-28'),false);
+  } finally { await store.close();  }
 });
 
 test('worker drains empty has_more pages and deduplicates callbacks', async (t) => {
@@ -113,12 +112,12 @@ test('worker drains empty has_more pages and deduplicates callbacks', async (t) 
     }
     sends++; return Response.json({errcode:0});
   });
-  const worker = new MessageWorker(cfg, async () => {models++; return {chunks:['ok']};});
+  const worker = await MessageWorker.create({...cfg,...testDatabase()}, async () => {models++; return {chunks:['ok']};});
   try {
-    worker.notify('kf','cb');
-    await until(() => sends === 1 && worker.store.pendingCount() === 0);
+    await worker.notify('kf','cb');
+    await until(async () => sends === 1 && (await worker.store.pendingCount()) === 0);
     assert.equal(pulls,2); assert.equal(models,1);
-    worker.notify('kf','cb'); await until(() => pulls === 3); await sleep(50);
+    await worker.notify('kf','cb'); await until(async () => pulls === 3); await sleep(50);
     assert.equal(sends,1);
   } finally { await worker.stop(); }
 });
@@ -132,15 +131,15 @@ test('worker isolates users, orders same-user commands and retries saved replies
     if (body.text.content === 'fast' && attempts++ === 0) return new Response('',{status:503});
     sent.push(body.text.content); return Response.json({errcode:0});
   });
-  const worker = new MessageWorker(cfg,async (m) => {
+  const worker = await MessageWorker.create({...cfg,...testDatabase()},async (m) => {
     handled.push(m.msgid); if (m.msgid === 'slow') await gate;
     return {chunks:[m.msgid]};
   });
   try {
-    add(worker.store,[msg('slow','A'),msg('reset','A','/reset'),msg('fast','B')]); worker.start();
-    await until(() => sent.includes('fast'));
+    await add(worker.store,[msg('slow','A'),msg('reset','A','/reset'),msg('fast','B')]); worker.start();
+    await until(async () => sent.includes('fast'));
     assert.deepEqual(handled,['slow','fast']); assert.equal(attempts,2);
-    release(); await until(() => worker.store.pendingCount() === 0);
+    release(); await until(async () => (await worker.store.pendingCount()) === 0);
     assert.deepEqual(handled,['slow','fast','reset']);
     assert.deepEqual(sent,['fast','slow','reset']);
   } finally { release(); await worker.stop(); }
@@ -156,53 +155,53 @@ test('server applies all-modality history bounds and text-file followup, reset r
     if (u.includes('send_msg')) return Response.json({errcode:0});
     throw new Error('unexpected URL');
   });
-  const bot = createServer(cfg); const store=bot.worker.store;
+  const bot = await createServer({...cfg,...testDatabase()}); const store=bot.worker.store;
   try {
-    add(store,[{...msg('file'),msgtype:'file',file:{media_id:'m',file_name:'notes.txt'}}] as any);
-    bot.worker.start(); await until(() => store.pendingCount()===0);
-    add(store,[msg('followup','user','预算是多少？')]); await until(() => chats.length===2 && store.pendingCount()===0);
+    await add(store,[{...msg('file'),msgtype:'file',file:{media_id:'m',file_name:'notes.txt'}}] as any);
+    bot.worker.start(); await until(async () => (await store.pendingCount())===0);
+    await add(store,[msg('followup','user','预算是多少？')]); await until(async () => chats.length===2 && (await store.pendingCount())===0);
     assert.ok(JSON.stringify(chats[1]).includes('123'));
     for (let i=0;i<4;i++) {
-      add(store,[{...msg('img'+i),msgtype:'image',image:{media_id:'m'}}] as any);
-      await until(() => store.pendingCount()===0);
+      await add(store,[{...msg('img'+i),msgtype:'image',image:{media_id:'m'}}] as any);
+      await until(async () => (await store.pendingCount())===0);
     }
-    const session=JSON.parse(store.session(JSON.stringify(['kf','user']))!);
+    const session=JSON.parse((await store.session(JSON.stringify(['kf','user'])))!);
     assert.equal(session.conversations[0].history.length,4);
     assert.equal(session.conversations[0].history[0].role,'user');
-    add(store,[msg('reset','user','/reset'),msg('after')]); await until(() => store.pendingCount()===0);
+    await add(store,[msg('reset','user','/reset'),msg('after')]); await until(async () => (await store.pendingCount())===0);
     assert.equal(chats.at(-1).messages.length,2);
   } finally {await bot.stopWorker();}
 });
 
-test('SQLite write failure retries the saved result without recharging or rerunning model', async (t) => {
+test('PostgreSQL write failure retries the saved result without recharging or rerunning model', async (t) => {
   clearTokenCache(); let models=0, sent=0, writes=0;
   t.mock.method(globalThis,'fetch',async (url: string | URL | Request) => {
     if (String(url).includes('gettoken')) return Response.json({errcode:0,access_token:'token',expires_in:7200});
     sent++; return Response.json({errcode:0});
   });
-  const worker=new MessageWorker(cfg,async () => {models++; return {chunks:['saved']};});
+  const worker=await MessageWorker.create({...cfg,...testDatabase()},async () => {models++; return {chunks:['saved']};});
   const original=worker.store.saveReply.bind(worker.store);
-  t.mock.method(worker.store,'saveReply', (...args: Parameters<typeof original>) => {
-    if (++writes===1) throw new Error('SQLITE_BUSY'); return original(...args);
+  t.mock.method(worker.store,'saveReply', async (...args: Parameters<typeof original>) => {
+    if (++writes===1) throw new Error('DATABASE_WRITE_ERROR'); return original(...args);
   });
   try {
-    add(worker.store); worker.start(); await until(() => sent===1 && worker.store.pendingCount()===0);
+    await add(worker.store); worker.start(); await until(async () => sent===1 && (await worker.store.pendingCount())===0);
     assert.equal(models,1); assert.equal(writes,2);
   } finally {await worker.stop();}
 });
 
 test('persisted outbox restart sends only unfinished parts without model invocation', async (t) => {
-  const dir=mkdtempSync(join(tmpdir(),'wecom-restart-'));const path=join(dir,'db.sqlite');
-  const store=new MessageStore(path);add(store);const job=store.nextJobs(1)[0];
-  store.saveReply(job,'session',['already sent','remaining']);store.markPart(job,0);store.close();
+  const dbConfig=testDatabase();
+  const store=await MessageStore.open(dbConfig);await add(store);const job=(await store.nextJobs(1))[0];
+  await store.saveReply(job,'session',['already sent','remaining']);await store.markPart(job,0);await store.close();
   clearTokenCache(); const sent: string[]=[]; let models=0;
   t.mock.method(globalThis,'fetch',async (url: string | URL | Request,init?: RequestInit) => {
     if(String(url).includes('gettoken')) return Response.json({errcode:0,access_token:'token',expires_in:7200});
     sent.push(JSON.parse(String(init?.body)).text.content);return Response.json({errcode:0});
   });
-  const worker=new MessageWorker({...cfg,sqlitePath:path},async()=>{models++;return {chunks:['unexpected']};});
-  try {worker.start();await until(()=>worker.store.pendingCount()===0);assert.deepEqual(sent,['remaining']);assert.equal(models,0);}
-  finally {await worker.stop();rmSync(dir,{recursive:true,force:true});}
+  const worker=await MessageWorker.create({...cfg,...dbConfig},async()=>{models++;return {chunks:['unexpected']};});
+  try {worker.start();await until(async()=>(await worker.store.pendingCount())===0);assert.deepEqual(sent,['remaining']);assert.equal(models,0);}
+  finally {await worker.stop();}
 });
 
 test('quota rejects further model requests, permits commands and isolates users', async (t) => {
@@ -211,10 +210,10 @@ test('quota rejects further model requests, permits commands and isolates users'
     if(String(url).includes('gettoken')) return Response.json({errcode:0,access_token:'token',expires_in:7200});
     sent.push(JSON.parse(String(init?.body)).text.content);return Response.json({errcode:0});
   });
-  const worker=new MessageWorker({...cfg,dailyRequestLimit:1},async(m)=>{models.push(m.msgid);return {chunks:[m.msgid]};});
+  const worker=await MessageWorker.create({...cfg,...testDatabase(),dailyRequestLimit:1},async(m)=>{models.push(m.msgid);return {chunks:[m.msgid]};});
   try {
-    add(worker.store,[msg('first'),msg('blocked'),msg('command','user','/help'),msg('other','B')]);worker.start();
-    await until(()=>worker.store.pendingCount()===0);
+    await add(worker.store,[msg('first'),msg('blocked'),msg('command','user','/help'),msg('other','B')]);worker.start();
+    await until(async()=>(await worker.store.pendingCount())===0);
     assert.deepEqual(models.sort(),['command','first','other']);assert.ok(sent.some(s=>s.includes('上限')));
   } finally {await worker.stop();}
 });
@@ -241,13 +240,13 @@ test('Office files are rejected before download and PDF upload uses official pur
     if(u.endsWith('/responses')) return Response.json({output_text:'summary'});
     throw new Error('unexpected');
   });
-  const bot=createServer(cfg);
+  const bot=await createServer({...cfg,...testDatabase()});
   try {
-    add(bot.worker.store,[{...msg('office'),msgtype:'file',file:{media_id:'office',file_name:'a.docx'}}] as any);
-    bot.worker.start();await until(()=>bot.worker.store.pendingCount()===0);
+    await add(bot.worker.store,[{...msg('office'),msgtype:'file',file:{media_id:'office',file_name:'a.docx'}}] as any);
+    bot.worker.start();await until(async()=>(await bot.worker.store.pendingCount())===0);
     assert.ok(!calls.some(c=>c.includes('/media/get')));
-    add(bot.worker.store,[{...msg('pdf'),msgtype:'file',file:{media_id:'pdf',file_name:'a.pdf'}}] as any);
-    await until(()=>bot.worker.store.pendingCount()===0);
+    await add(bot.worker.store,[{...msg('pdf'),msgtype:'file',file:{media_id:'pdf',file_name:'a.pdf'}}] as any);
+    await until(async()=>(await bot.worker.store.pendingCount())===0);
     assert.ok(calls.some(c=>c.endsWith('/responses')));
   } finally {await bot.stopWorker();}
 });

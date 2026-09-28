@@ -3,6 +3,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { verifySignature, decrypt, xmlGet } from './lib/wecom-crypto.ts';
 import { getMedia } from './lib/wecom-api.ts';
+import { databaseConfig } from './lib/message-store.ts';
+import type { DatabaseConfig } from './lib/message-store.ts';
 import { MessageWorker } from './lib/message-worker.ts';
 import { errorCode } from './lib/http-client.ts';
 import type { KfMessage } from './lib/wecom-api.ts';
@@ -12,7 +14,7 @@ import type { HistoryMessage } from './lib/llm.ts';
 
 // ---------- 配置 ----------
 
-export interface Config {
+export interface Config extends DatabaseConfig {
   port: number;
   corpId: string;
   kfSecret: string;
@@ -28,7 +30,6 @@ export interface Config {
   systemPrompt: string;
   maxTurns: number;
   fileMaxMb: number;
-  sqlitePath: string;
   upstreamTimeoutMs: number;
   fileTaskTimeoutMs: number;
   maxConcurrentJobs: number;
@@ -68,7 +69,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     systemPrompt: env.LLM_SYSTEM_PROMPT || '你是一位用户的好朋友，通过微信聊天。回复要口语化、简洁自然，一般不超过 150 字，不用 markdown 格式，分点列表。',
     maxTurns: Number(env.MAX_HISTORY_TURNS || 12),
     fileMaxMb: Number(env.FILE_MAX_MB || 20),
-    sqlitePath: env.SQLITE_PATH || './data/bot.sqlite',
+    ...databaseConfig(env),
     upstreamTimeoutMs: Number(env.UPSTREAM_TIMEOUT_MS || 30000),
     fileTaskTimeoutMs: Number(env.FILE_TASK_TIMEOUT_MS || 90000),
     maxConcurrentJobs: Number(env.MAX_CONCURRENT_JOBS || 2),
@@ -370,8 +371,8 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
 
 // ---------- HTTP 服务 ----------
 
-export function createServer(cfg: Config) {
-  const worker = new MessageWorker(cfg, async (msg, saved) => {
+export async function createServer(cfg: Config) {
+  const worker = await MessageWorker.create(cfg, async (msg, saved) => {
     const store = getUserStore(saved);
     const conv = getActive(store);
     let reply: string | null = null;
@@ -441,8 +442,9 @@ export function createServer(cfg: Config) {
         }
         if (!tooLarge) body += c;
       });
-      req.on('end', () => {
+      req.on('end', async () => {
         if (tooLarge) return;
+        const ackDeadline = setTimeout(() => { if (!res.headersSent) res.writeHead(503).end(); }, 4500);
         try {
           const encrypt = xmlGet(body, 'Encrypt');
           if (!encrypt || !verifySignature(cfg.token, sigParams, encrypt)) {
@@ -455,13 +457,13 @@ export function createServer(cfg: Config) {
           const event = xmlGet(message, 'Event');
           if (event === 'kf_msg_or_event') {
             const kfid = xmlGet(message, 'OpenKfId') || cfg.openKfId;
-            if (kfid && (!cfg.openKfId || kfid === cfg.openKfId)) worker.notify(kfid, xmlGet(message, 'Token') || '');
+            if (kfid && (!cfg.openKfId || kfid === cfg.openKfId)) await worker.notify(kfid, xmlGet(message, 'Token') || '');
           }
-          res.writeHead(200, { 'content-type': 'text/plain' }).end(''); // 回空串表示成功且不重推
+          if (!res.headersSent) res.writeHead(200, { 'content-type': 'text/plain' }).end(''); // 回空串表示成功且不重推
         } catch (err) {
           console.error('[webhook]', errorCode(err));
-          res.writeHead(500).end();
-        }
+          if (!res.headersSent) res.writeHead(503).end();
+        } finally { clearTimeout(ackDeadline); }
       });
       return;
     }
@@ -477,11 +479,11 @@ export function createServer(cfg: Config) {
 
 // ---------- 入口 ----------
 
-export function main(): void {
+export async function main(): Promise<void> {
   process.umask(0o077);
   loadEnvFile(new URL('./.env', import.meta.url).pathname);
   const cfg = loadConfig();
-  const server = createServer(cfg);
+  const server = await createServer(cfg);
   const shutdown = () => {
     server.close();
     const deadline = setTimeout(() => process.exit(1), 15000);
@@ -497,5 +499,5 @@ export function main(): void {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main();
+  void main().catch(() => { console.error('[startup] 启动失败，请检查数据库连接、schema 权限、实例占用及必填配置'); process.exitCode = 1; });
 }
