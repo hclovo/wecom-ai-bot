@@ -4,6 +4,8 @@
 
 零依赖运行（Node ≥ 23.6 自带全部能力，原生直接执行 `.ts`，无需编译），单进程即可运行。`npm install` 仅用于类型检查（devDependencies：typescript、@types/node）。
 
+**文档索引**：[需求文档 REQUIREMENTS.md](REQUIREMENTS.md) ｜ [执行进度 PROGRESS.md](PROGRESS.md) ｜ [部署指南 DEPLOY.md](DEPLOY.md)
+
 ```
 微信用户 ──微信──▶ 微信客服（官方通道，合规无封号风险）
                       │ 事件回调（AES 加密 XML）
