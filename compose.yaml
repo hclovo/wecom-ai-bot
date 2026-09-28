@@ -5,7 +5,7 @@ services:
     container_name: wecom-ai-bot
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8788:8788"
+      - "8788:8788"
     env_file: .env
     environment:
       PORT: "8788"
