@@ -15,7 +15,8 @@ export function sha1Signature(token: string, timestamp: string, nonce: string, e
 }
 
 export function verifySignature(token: string, { msg_signature, timestamp, nonce }: SignatureParams, encrypt: string): boolean {
-  return sha1Signature(token, timestamp, nonce, encrypt) === msg_signature;
+  if (!/^[a-f0-9]{40}$/.test(msg_signature)) return false;
+  return crypto.timingSafeEqual(Buffer.from(sha1Signature(token, timestamp, nonce, encrypt)), Buffer.from(msg_signature));
 }
 
 function keyFromEncodingAESKey(encodingAESKey: string): Buffer {
@@ -30,8 +31,11 @@ export function decrypt(encryptB64: string, encodingAESKey: string): { message: 
   decipher.setAutoPadding(false);
   let plain = Buffer.concat([decipher.update(Buffer.from(encryptB64, 'base64')), decipher.final()]);
   const pad = plain[plain.length - 1];
+  if (plain.length < 32 || pad < 1 || pad > 32 || !plain.subarray(-pad).every((b) => b === pad)) throw new Error('无效密文 padding');
   plain = plain.subarray(0, plain.length - pad);
+  if (plain.length < 20) throw new Error('无效密文长度');
   const msgLen = plain.readUInt32BE(16);
+  if (msgLen > plain.length - 20) throw new Error('无效消息长度');
   return {
     message: plain.subarray(20, 20 + msgLen).toString('utf8'),
     receiveId: plain.subarray(20 + msgLen).toString('utf8'),

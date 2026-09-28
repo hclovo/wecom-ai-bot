@@ -1,3 +1,4 @@
+import { requestJson } from './http-client.ts';
 // 调用 OpenAI 兼容的 chat completions 接口（火山方舟 /api/v3 即此协议）
 
 export type ChatContentPart =
@@ -23,21 +24,17 @@ export interface ChatOptions {
   model: string;
   systemPrompt: string;
   history: ChatMessage[];
+  timeoutMs?: number;
 }
 
-export async function chatCompletion({ baseUrl, apiKey, model, systemPrompt, history }: ChatOptions): Promise<string> {
+export async function chatCompletion({ baseUrl, apiKey, model, systemPrompt, history, timeoutMs }: ChatOptions): Promise<string> {
   const messages = [{ role: 'system', content: systemPrompt }, ...history];
-  const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+  const data = await requestJson<{ choices?: Array<{ message?: { content?: unknown } }> }>(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({ model, messages, temperature: 0.8 }),
-  });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`LLM HTTP ${res.status}: ${detail.slice(0, 500)}`);
-  }
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: unknown } }> };
+  }, { timeoutMs });
   const content = data?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || content === '') throw new Error(`LLM 返回异常: ${JSON.stringify(data).slice(0, 300)}`);
+  if (typeof content !== 'string' || content === '') throw new Error('LLM 返回异常');
   return content;
 }

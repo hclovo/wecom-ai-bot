@@ -2,7 +2,9 @@ import http from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { verifySignature, decrypt, xmlGet } from './lib/wecom-crypto.ts';
-import { syncMessages, sendText, getMedia, clearTokenCache } from './lib/wecom-api.ts';
+import { getMedia } from './lib/wecom-api.ts';
+import { MessageWorker } from './lib/message-worker.ts';
+import { errorCode } from './lib/http-client.ts';
 import type { KfMessage } from './lib/wecom-api.ts';
 import { uploadFile, waitFileActive, askFile } from './lib/ark-files.ts';
 import { chatCompletion } from './lib/llm.ts';
@@ -26,6 +28,17 @@ export interface Config {
   systemPrompt: string;
   maxTurns: number;
   fileMaxMb: number;
+  sqlitePath: string;
+  upstreamTimeoutMs: number;
+  fileTaskTimeoutMs: number;
+  maxConcurrentJobs: number;
+  maxQueueSize: number;
+  dailyRequestLimit: number;
+  syncPollMs: number;
+  retryBaseMs: number;
+  maxSendAttempts: number;
+  retentionDays: number;
+  mediaPath: string;
 }
 
 export function loadEnvFile(file: string): void {
@@ -55,6 +68,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     systemPrompt: env.LLM_SYSTEM_PROMPT || '你是一位用户的好朋友，通过微信聊天。回复要口语化、简洁自然，一般不超过 150 字，不用 markdown 格式，分点列表。',
     maxTurns: Number(env.MAX_HISTORY_TURNS || 12),
     fileMaxMb: Number(env.FILE_MAX_MB || 20),
+    sqlitePath: env.SQLITE_PATH || './data/bot.sqlite',
+    upstreamTimeoutMs: Number(env.UPSTREAM_TIMEOUT_MS || 30000),
+    fileTaskTimeoutMs: Number(env.FILE_TASK_TIMEOUT_MS || 90000),
+    maxConcurrentJobs: Number(env.MAX_CONCURRENT_JOBS || 2),
+    maxQueueSize: Number(env.MAX_QUEUE_SIZE || 1000),
+    dailyRequestLimit: Number(env.DAILY_REQUEST_LIMIT || 100),
+    syncPollMs: Number(env.SYNC_POLL_MS || 60000),
+    retryBaseMs: Number(env.RETRY_BASE_MS || 1000),
+    maxSendAttempts: Number(env.MAX_SEND_ATTEMPTS || 5),
+    retentionDays: Number(env.RETENTION_DAYS || 30),
+    mediaPath: env.WECOM_MEDIA_PATH || '/cgi-bin/media/get',
+
   };
   const missing = Object.entries({
     WECOM_CORP_ID: cfg.corpId,
@@ -66,6 +91,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     LLM_MODEL: cfg.llmModel,
   }).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length > 0) throw new Error(`缺少配置: ${missing.join(', ')}（参考 .env.example）`);
+  for (const key of ['port', 'maxTurns', 'fileMaxMb', 'upstreamTimeoutMs', 'fileTaskTimeoutMs',
+    'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
+    if (!Number.isSafeInteger(cfg[key]) || cfg[key] < 1) throw new Error(`配置 ${key} 必须为正整数`);
+  }
+  if (cfg.port > 65535) throw new Error('PORT 超出范围');
+  if (!/^\/[a-zA-Z0-9/_-]+$/.test(cfg.mediaPath)) throw new Error('WECOM_MEDIA_PATH 必须是 API 路径');
+  if (!/^[A-Za-z0-9+/]{43}$/.test(cfg.aesKey!)) throw new Error('EncodingAESKey 必须为 43 位 Base64 字符');
   // 走到这里缺失校验已保证必填字段非空
   return cfg as Config;
 }
@@ -73,7 +105,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 // ---------- 文件类型 ----------
 
 const TEXT_EXT = new Set(['txt', 'md', 'markdown', 'csv', 'json', 'log', 'xml', 'yml', 'yaml', 'html', 'htm', 'ts', 'tsx', 'js', 'py', 'java', 'c', 'h', 'cpp', 'go', 'rs', 'sql', 'sh', 'ini', 'toml']);
-const DOC_EXT = new Set(['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']);
+const DOC_EXT = new Set(['pdf']);
+const OFFICE_EXT = new Set(['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']);
 const TEXT_FILE_CHAR_LIMIT = 40000;
 
 function extOf(filename = ''): string {
@@ -83,27 +116,20 @@ function extOf(filename = ''): string {
 
 // ---------- 回复发送 ----------
 
-const CHUNK_LIMIT = 1000; // 企业微信文本消息上限约 2048 字节，留足余量
-const SEND_GAP_MS = 400;
+const CHUNK_LIMIT = 1000; // conservative UTF-8 byte budget, including Chinese and emoji
 
-// 短段落合并为一条消息；超长段落按上限硬切
 export function splitReply(text: string, limit = CHUNK_LIMIT): string[] {
-  const chunks = [];
-  let cur = '';
-  for (const para of text.split(/\n{2,}/)) {
-    if (para.length > limit) {
-      if (cur) { chunks.push(cur); cur = ''; }
-      for (let i = 0; i < para.length; i += limit) chunks.push(para.slice(i, i + limit));
-      continue;
-    }
-    if (cur && (cur + '\n\n' + para).length > limit) {
-      chunks.push(cur);
-      cur = para;
-    } else {
-      cur = cur ? cur + '\n\n' + para : para;
-    }
+  if (!Number.isSafeInteger(limit) || limit < 4) throw new Error('切分字节上限至少为 4');
+  const chunks: string[] = [];
+  let current = '';
+  let bytes = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char, 'utf8');
+    if (bytes + size > limit) { chunks.push(current); current = ''; bytes = 0; }
+    current += char;
+    bytes += size;
   }
-  if (cur) chunks.push(cur);
+  if (current) chunks.push(current);
   return chunks;
 }
 
@@ -122,6 +148,7 @@ interface Conversation {
   title: string;
   history: HistoryMessage[];
   pendingFile: PendingFile | null;
+  textFile?: { filename: string; content: string };
   updatedAt: number;
 }
 
@@ -131,21 +158,24 @@ interface UserStore {
   activeId: number;
 }
 
-interface BotState {
-  sessions: Map<string, UserStore>; // external_userid -> 会话组
-  cursors: Map<string, string>;     // open_kfid -> next_cursor
-  seenMsgIds: Set<string>;
+function getUserStore(saved?: string): UserStore {
+  if (saved) {
+    const data = JSON.parse(saved) as { conversations: Conversation[]; nextId: number; activeId: number };
+    return { ...data, conversations: new Map(data.conversations.map((c) => [c.id, c])) };
+  }
+  return { conversations: new Map([[1, { id: 1, title: '闲聊', history: [], pendingFile: null, updatedAt: Date.now() }]]), nextId: 2, activeId: 1 };
 }
 
-function getUserStore(state: BotState, user: string): UserStore {
-  let store = state.sessions.get(user);
-  if (!store) {
-    // 会话 #1 固定为默认闲聊会话，编号从 2 起
-    store = { conversations: new Map(), nextId: 2, activeId: 1 };
-    store.conversations.set(1, { id: 1, title: '闲聊', history: [], pendingFile: null, updatedAt: Date.now() });
-    state.sessions.set(user, store);
+function serializeStore(store: UserStore): string {
+  return JSON.stringify({ ...store, conversations: [...store.conversations.values()] });
+}
+
+function appendTurn(cfg: Config, conv: Conversation, question: string, answer: string): void {
+  conv.history.push({ role: 'user', content: question }, { role: 'assistant', content: answer });
+  while (conv.history.length > cfg.maxTurns * 2 || (conv.history.length > 2 && JSON.stringify(conv.history).length > 80000)) {
+    conv.history.splice(0, 2);
   }
-  return store;
+  touch(conv);
 }
 
 function getActive(store: UserStore): Conversation {
@@ -170,7 +200,7 @@ function handleCommand(store: UserStore, conv: Conversation, content: string): s
 
     case '/new': {
       const id = store.nextId++;
-      store.conversations.set(id, { id, title: arg || `会话 ${id}`, history: [], pendingFile: null, updatedAt: Date.now() });
+      store.conversations.set(id, { id, title: arg.slice(0, 40) || `会话 ${id}`, history: [], pendingFile: null, updatedAt: Date.now() });
       store.activeId = id;
       // 会话数超限时淘汰最旧的非活跃会话
       if (store.conversations.size > MAX_SESSIONS_PER_USER) {
@@ -194,6 +224,7 @@ function handleCommand(store: UserStore, conv: Conversation, content: string): s
       const target = store.conversations.get(id);
       if (!target) return `没有 #${arg || '?'} 这个会话，发 /list 查看。`;
       store.activeId = id;
+      touch(target);
       return `已切换到 #${id}「${target.title}」（${target.history.length} 条消息）。`;
     }
 
@@ -214,18 +245,21 @@ function handleCommand(store: UserStore, conv: Conversation, content: string): s
     case '/reset':
       conv.history = [];
       conv.pendingFile = null;
+      conv.textFile = undefined;
+      touch(conv);
       return `已清空当前会话 #${conv.id} 的上下文。`;
   }
   return `未知指令「${cmd}」，发 /help 查看可用指令。`;
 }
 
-async function handleText(cfg: Config, state: BotState, user: string, store: UserStore, conv: Conversation, content: string): Promise<string> {
+async function handleText(cfg: Config, store: UserStore, conv: Conversation, content: string): Promise<string> {
   if (content.startsWith('/')) return handleCommand(store, conv, content);
   // 首条消息给默认命名的会话起标题
   if (conv.title === '闲聊' && conv.history.length === 0) conv.title = content.slice(0, 12);
   if (conv.pendingFile) {
     const { fileId, filename } = conv.pendingFile;
     const answer = await askFile({
+      timeoutMs: cfg.upstreamTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
       model: cfg.llmModel,
@@ -233,22 +267,21 @@ async function handleText(cfg: Config, state: BotState, user: string, store: Use
       question: content,
       history: recentHistory(conv),
     });
-    conv.history.push({ role: 'user', content: `[文件 ${filename}] 问：${content}` });
-    conv.history.push({ role: 'assistant', content: answer });
-    touch(conv);
+    appendTurn(cfg, conv, `[文件 ${filename}] 问：${content}`, answer);
     return answer;
   }
-  conv.history.push({ role: 'user', content });
-  while (conv.history.length > cfg.maxTurns * 2) conv.history.shift();
   const answer = await chatCompletion({
+    timeoutMs: cfg.upstreamTimeoutMs,
     baseUrl: cfg.llmBaseUrl,
     apiKey: cfg.llmApiKey,
     model: cfg.llmModel,
     systemPrompt: cfg.systemPrompt,
-    history: conv.history,
+    history: [
+      ...(conv.textFile ? [{ role: 'user' as const, content: `参考文件「${conv.textFile.filename}」：\n${conv.textFile.content}` }] : []),
+      ...conv.history, { role: 'user', content },
+    ],
   });
-  conv.history.push({ role: 'assistant', content: answer });
-  touch(conv);
+  appendTurn(cfg, conv, content, answer);
   return answer;
 }
 
@@ -257,8 +290,10 @@ async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Pro
   if (!mediaId) return null;
   const buf = await getMedia(cfg, mediaId);
   if (buf.length > cfg.fileMaxMb * 1024 * 1024) return `图片超过 ${cfg.fileMaxMb}MB 了，我收不动～`;
-  const dataUri = `data:image/jpeg;base64,${buf.toString('base64')}`;
+  const mime = buf.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ? 'image/png' : 'image/jpeg';
+  const dataUri = `data:${mime};base64,${buf.toString('base64')}`;
   const answer = await chatCompletion({
+    timeoutMs: cfg.upstreamTimeoutMs,
     baseUrl: cfg.llmBaseUrl,
     apiKey: cfg.llmApiKey,
     model: cfg.llmVisionModel,
@@ -271,8 +306,8 @@ async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Pro
       ],
     }],
   });
-  conv.history.push({ role: 'user', content: '[图片]' });
-  conv.history.push({ role: 'assistant', content: answer });
+  appendTurn(cfg, conv, '[图片]', answer);
+  conv.textFile = undefined;
   conv.pendingFile = null;
   touch(conv);
   return answer;
@@ -282,9 +317,10 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
   const mediaId = msg.file?.media_id;
   const filename = msg.file?.file_name || '未命名文件';
   if (!mediaId) return null;
-  const buf = await getMedia(cfg, mediaId);
-  if (buf.length > cfg.fileMaxMb * 1024 * 1024) return `文件超过 ${cfg.fileMaxMb}MB 了，我收不动～`;
   const ext = extOf(filename);
+  if (OFFICE_EXT.has(ext)) return '目前请先把 Word/Excel/PPT 导出为 PDF，再发给我解读。';
+  if (!TEXT_EXT.has(ext) && !DOC_EXT.has(ext)) return `这个格式（.${ext || '未知'}）暂不支持，请发送图片、PDF 或文本文件。`;
+  const buf = await getMedia(cfg, mediaId);
 
   if (TEXT_EXT.has(ext)) {
     let content = buf.toString('utf8');
@@ -292,6 +328,7 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
       content = `${content.slice(0, TEXT_FILE_CHAR_LIMIT)}\n（文件过长，已截断）`;
     }
     const answer = await chatCompletion({
+      timeoutMs: cfg.upstreamTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
       model: cfg.llmModel,
@@ -301,124 +338,62 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
         content: `用户发来文本文件「${filename}」，内容如下：\n\n${content}\n\n请用中文简要总结这个文件的要点。`,
       }],
     });
-    conv.history.push({ role: 'user', content: `[文本文件] ${filename}` });
-    conv.history.push({ role: 'assistant', content: answer });
+    appendTurn(cfg, conv, `[文本文件] ${filename}`, answer);
+    conv.textFile = { filename, content };
     conv.pendingFile = null;
     touch(conv);
     return answer;
   }
 
   if (DOC_EXT.has(ext)) {
-    const up = await uploadFile({ baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, buffer: buf, filename });
-    await waitFileActive({ baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, fileId: up.id });
+    const signal = AbortSignal.timeout(cfg.fileTaskTimeoutMs);
+    const up = await uploadFile({ signal, timeoutMs: cfg.upstreamTimeoutMs, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, buffer: buf, filename });
+    await waitFileActive({ signal, timeoutMs: cfg.fileTaskTimeoutMs, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, fileId: up.id });
     const answer = await askFile({
+      timeoutMs: cfg.upstreamTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
       model: cfg.llmModel,
+      signal,
       fileId: up.id,
       question: '请用中文简要总结这个文件的要点。',
     });
     conv.pendingFile = { fileId: up.id, filename };
-    conv.history.push({ role: 'user', content: `[文档] ${filename}` });
-    conv.history.push({ role: 'assistant', content: answer });
+    appendTurn(cfg, conv, `[文档] ${filename}`, answer);
+    conv.textFile = undefined;
     touch(conv);
     return `${answer}\n\n文件已就绪，你可以继续追问。`;
   }
 
-  return `这个格式（.${ext || '未知'}）我还处理不了。支持：图片、PDF/Word/Excel/PPT、常见文本文件。`;
+  return null;
 }
 
 // ---------- HTTP 服务 ----------
 
 export function createServer(cfg: Config) {
-  // 每个服务实例独立的运行状态
-  const state: BotState = {
-    sessions: new Map(),  // external_userid -> { conversations, nextId, activeId }
-    cursors: new Map(),   // open_kfid -> next_cursor
-    seenMsgIds: new Set(),
-  };
-
-  async function sendReply(kfid: string, user: string, msgid: string, reply: string): Promise<void> {
-    const chunks = splitReply(reply);
-    for (let i = 0; i < chunks.length; i++) {
-      if (i > 0) await new Promise((r) => setTimeout(r, SEND_GAP_MS));
-      try {
-        await sendText(cfg, {
-          touser: user,
-          openKfId: kfid,
-          msgid: `bot-${msgid}-${i}`,
-          content: chunks[i],
-        });
-      } catch (err) {
-        const e = err as Error & { errcode?: number };
-        console.error('[send]:', e.message);
-        if (e.errcode === 60020) console.error('（企业微信要求在管理端配置服务器「可信 IP」）');
-        if (e.errcode === 40014 || e.errcode === 42001) clearTokenCache();
-        return;
-      }
-    }
-  }
-
-  async function handleMessage(kfid: string, msg: KfMessage): Promise<void> {
-    // origin=3 表示微信客户发来的消息；客服/系统消息不处理
-    if (msg.origin !== 3 || !msg.external_userid) return;
-    const user = msg.external_userid;
-    const store = getUserStore(state, user);
+  const worker = new MessageWorker(cfg, async (msg, saved) => {
+    const store = getUserStore(saved);
     const conv = getActive(store);
-
     let reply: string | null = null;
     try {
       switch (msg.msgtype) {
-        case 'text':
-          reply = await handleText(cfg, state, user, store, conv, (msg.text?.content || '').trim());
-          break;
-        case 'image':
-          reply = await handleImage(cfg, conv, msg);
-          break;
-        case 'file':
-          reply = await handleFile(cfg, conv, msg);
-          break;
-        case 'voice':
-          reply = '语音消息我还听不了，打字发我吧～';
-          break;
-        case 'video':
-          reply = '视频处理还没上线，先发文字、图片或文档吧';
-          break;
-        default:
-          return; // 事件类消息（进入会话等）静默忽略
+        case 'text': reply = await handleText(cfg, store, conv, (msg.text?.content || '').trim()); break;
+        case 'image': reply = await handleImage(cfg, conv, msg); break;
+        case 'file': reply = await handleFile(cfg, conv, msg); break;
+        case 'voice': reply = '语音消息我还听不了，打字发我吧～'; break;
+        case 'video': reply = '视频处理还没上线，先发文字、图片或文档吧'; break;
       }
-    } catch (err) {
-      console.error(`[msg ${msg.msgtype}] ${user}:`, (err as Error).message);
-      reply = '处理时出了点小问题，稍后再试试？';
+      return { session: serializeStore(store), chunks: reply ? splitReply(reply) : [] };
+    } catch (error) {
+      console.error('[model]', errorCode(error));
+      // Discard partial mutations on failure. Persist an error reply for delivery retries.
+      return { chunks: ['处理时出了点小问题，请稍后重试；如果正在追问文件，也可以重新发送文件。'] };
     }
-    if (reply) await sendReply(kfid, user, msg.msgid, reply);
-  }
-
-  let queueTail: Promise<void> = Promise.resolve();
-  const enqueue = (job: () => Promise<void>) => {
-    queueTail = queueTail.then(job).catch((err) => console.error('[worker]', err));
-  };
-
-  function handleEvent({ openKfId, callbackToken }: { openKfId: string; callbackToken: string }): void {
-    enqueue(async () => {
-      const kfid = openKfId || cfg.openKfId;
-      if (!kfid) return;
-      const cursor = state.cursors.get(kfid) || '';
-      const data = await syncMessages(cfg, { cursor, token: callbackToken, openKfId: kfid });
-      state.cursors.set(kfid, data.next_cursor || cursor);
-      for (const msg of data.msg_list || []) {
-        if (state.seenMsgIds.has(msg.msgid)) continue;
-        state.seenMsgIds.add(msg.msgid);
-        if (state.seenMsgIds.size > 10000) {
-          for (const id of state.seenMsgIds) { state.seenMsgIds.delete(id); if (state.seenMsgIds.size <= 5000) break; }
-        }
-        await handleMessage(kfid, msg);
-      }
-    });
-  }
-
+  });
+  let stopping: Promise<void> | undefined;
+  const stopWorker = () => stopping ??= worker.stop();
   const recvId = cfg.receiveId || cfg.corpId;
-  return http.createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     const url = new URL(req.url as string, 'http://localhost');
     if (url.pathname === '/healthz') {
       res.writeHead(200).end('ok');
@@ -442,9 +417,11 @@ export function createServer(cfg: Config) {
         res.writeHead(401).end('bad signature');
         return;
       }
-      const { message, receiveId } = decrypt(echostr, cfg.aesKey);
+      let decoded: ReturnType<typeof decrypt>;
+      try { decoded = decrypt(echostr, cfg.aesKey); } catch { res.writeHead(400).end('bad ciphertext'); return; }
+      const { message, receiveId } = decoded;
       if (recvId && receiveId !== recvId) {
-        res.writeHead(401).end(`receiveId mismatch: ${receiveId}`);
+        res.writeHead(401).end('receiveId mismatch');
         return;
       }
       res.writeHead(200, { 'content-type': 'text/plain' }).end(message);
@@ -453,26 +430,36 @@ export function createServer(cfg: Config) {
 
     if (req.method === 'POST') {
       let body = '';
-      req.on('data', (c) => { body += c; });
+      let bodyBytes = 0;
+      let tooLarge = false;
+      req.on('data', (c: Buffer) => {
+        bodyBytes += c.length;
+        if (bodyBytes > 65536) {
+          if (!tooLarge) res.writeHead(413).end();
+          tooLarge = true; body = '';
+          return;
+        }
+        if (!tooLarge) body += c;
+      });
       req.on('end', () => {
+        if (tooLarge) return;
         try {
           const encrypt = xmlGet(body, 'Encrypt');
           if (!encrypt || !verifySignature(cfg.token, sigParams, encrypt)) {
             res.writeHead(401).end();
             return;
           }
-          const { message } = decrypt(encrypt, cfg.aesKey);
+          const { message, receiveId } = decrypt(encrypt, cfg.aesKey);
+          if (receiveId !== recvId) { res.writeHead(401).end(); return; }
           // 回调事件格式：Event=kf_msg_or_event, Token(用于首次 sync_msg), OpenKfId
           const event = xmlGet(message, 'Event');
           if (event === 'kf_msg_or_event') {
-            handleEvent({
-              openKfId: xmlGet(message, 'OpenKfId') || '',
-              callbackToken: xmlGet(message, 'Token') || '',
-            });
+            const kfid = xmlGet(message, 'OpenKfId') || cfg.openKfId;
+            if (kfid && (!cfg.openKfId || kfid === cfg.openKfId)) worker.notify(kfid, xmlGet(message, 'Token') || '');
           }
           res.writeHead(200, { 'content-type': 'text/plain' }).end(''); // 回空串表示成功且不重推
         } catch (err) {
-          console.error('[webhook]', err);
+          console.error('[webhook]', errorCode(err));
           res.writeHead(500).end();
         }
       });
@@ -481,14 +468,28 @@ export function createServer(cfg: Config) {
 
     res.writeHead(405).end();
   });
+  server.requestTimeout = 10000;
+  server.headersTimeout = 10000;
+  server.on('listening', () => worker.start());
+  server.on('close', () => { void stopWorker(); });
+  return Object.assign(server, { stopWorker, worker });
 }
 
 // ---------- 入口 ----------
 
 export function main(): void {
+  process.umask(0o077);
   loadEnvFile(new URL('./.env', import.meta.url).pathname);
   const cfg = loadConfig();
   const server = createServer(cfg);
+  const shutdown = () => {
+    server.close();
+    const deadline = setTimeout(() => process.exit(1), 15000);
+    deadline.unref();
+    void server.stopWorker().then(() => { clearTimeout(deadline); });
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
   server.listen(cfg.port, () => {
     console.log(`wecom-ai-bot listening on :${cfg.port}`);
     console.log(`回调 URL: http://<你的域名或IP>:${cfg.port}/webhook`);

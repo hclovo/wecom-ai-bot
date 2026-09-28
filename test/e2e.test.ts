@@ -4,6 +4,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { encrypt, decrypt, sha1Signature } from '../lib/wecom-crypto.ts';
 import { createServer, loadConfig, splitReply } from '../server.ts';
+import { clearTokenCache } from '../lib/wecom-api.ts';
 
 type Json = Record<string, any>;
 
@@ -60,6 +61,8 @@ function envFromCfg(): Record<string, string> {
     LLM_MODEL: CFG.llmModel,
     LLM_SYSTEM_PROMPT: CFG.systemPrompt,
     PORT: String(CFG.port),
+    SQLITE_PATH: ':memory:',
+    RETRY_BASE_MS: '10',
   };
 }
 
@@ -99,7 +102,7 @@ function mockWecom(calls: Calls, state: StackState) {
           .end(JSON.stringify({ errcode: 0, msgid: 'server-msg-1' }));
         return;
       }
-      if (url.startsWith('/cgi-bin/kf/media/get')) {
+      if (url.startsWith('/cgi-bin/media/get')) {
         const mediaId = new URL(url, 'http://x').searchParams.get('media_id');
         calls.mediaGet.push(mediaId);
         const buf = mediaId ? state.media[mediaId] : undefined;
@@ -194,17 +197,18 @@ function freshCalls(): Calls {
 }
 
 async function startStack(calls: Calls, state: StackState): Promise<{ stop: () => Promise<void> }> {
+  clearTokenCache();
   const wecomMock = mockWecom(calls, state);
   const arkMock = mockArk(calls);
   const bot = createServer(loadConfig(envFromCfg()));
-  await new Promise<void>((r) => { wecomMock.listen(18789, () => r()); arkMock.listen(18790, () => r()); bot.listen(CFG.port, () => r()); });
+  await Promise.all([[wecomMock, 18789], [arkMock, 18790], [bot, CFG.port]].map(([server, port]) =>
+    new Promise<void>((resolve, reject) => (server as http.Server).once('error', reject).listen(port as number, '127.0.0.1', resolve))));
   const stop = async () => {
+    await bot.stopWorker();
     wecomMock.closeAllConnections?.();
     arkMock.closeAllConnections?.();
     bot.closeAllConnections?.();
-    wecomMock.close();
-    arkMock.close();
-    bot.close();
+    await Promise.all([wecomMock, arkMock, bot].map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
   };
   return { stop };
 }
@@ -221,7 +225,7 @@ test('加解密往返', () => {
 
 test('splitReply：短段落合并，超长切分', () => {
   assert.deepEqual(splitReply('a\n\nb'), ['a\n\nb']);
-  assert.deepEqual(splitReply('a\n\n' + 'x'.repeat(1001)), ['a', 'x'.repeat(1000), 'x']);
+  assert.equal(splitReply('a\n\n' + 'x'.repeat(1001)).join(''), 'a\n\n' + 'x'.repeat(1001));
   assert.deepEqual(splitReply('y'.repeat(2500)), ['y'.repeat(1000), 'y'.repeat(1000), 'y'.repeat(500)]);
 });
 

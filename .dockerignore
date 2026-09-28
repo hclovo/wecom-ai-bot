@@ -7,3 +7,9 @@ test/
 *.md
 *.log
 .DS_Store
+
+data/
+backups/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

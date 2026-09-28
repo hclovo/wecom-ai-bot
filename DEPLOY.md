@@ -21,7 +21,7 @@
 
 ### 2.1 安装 Node 24 LTS
 
-项目零运行时依赖，只需 Node 本体。要求 Node ≥ 23.6（原生 type stripping，可直接运行 `.ts`，无需编译），建议装 Node 24 LTS。用 NodeSource 安装：
+项目零运行时依赖，只需 Node 本体。要求 Node ≥ 24.0（原生 type stripping，可直接运行 `.ts`，无需编译），建议装 Node 24 LTS。用 NodeSource 安装：
 
 ```bash
 # 安装 NodeSource 源并安装 Node 24 LTS
@@ -47,7 +47,7 @@ nvm install 24
 不用 root 跑服务，创建一个无登录 shell 的专用用户：
 
 ```bash
-sudo useradd --system --create-home --shell /usr/sbin/nologin wecombot
+sudo useradd --system --create-home --shell /usr/sbin/nologin wecomb
 sudo mkdir -p /opt/wecom-ai-bot
 sudo chown wecomb:wecomb /opt/wecom-ai-bot
 ```
@@ -116,7 +116,7 @@ sudo -u wecomb nano .env    # 或 vim
 
 ```bash
 openssl rand -hex 16    # 可用作 Token
-openssl rand -base64 32 | tr -d '=+/' | cut -c1-43   # 可用作 43 位 EncodingAESKey
+openssl rand -base64 32 | tr -d '=\n' | cut -c1-43   # 可用作 43 位 EncodingAESKey
 ```
 
 **务必收紧权限（密钥文件，只有运行用户可读）：**
@@ -185,6 +185,8 @@ WorkingDirectory=/opt/wecom-ai-bot
 ExecStart=/usr/bin/node /opt/wecom-ai-bot/server.ts
 Restart=always
 RestartSec=3
+TimeoutStopSec=20
+UMask=0077
 # .env 由服务自身读取（dotenv 逻辑内置于 server.ts），无需 EnvironmentFile
 # 如需指定端口可取消下行注释
 # Environment=PORT=8788
@@ -287,7 +289,7 @@ https://你的域名/webhook
 
 1. **配置接收消息回调**：
    - URL 填 `https://你的域名/webhook`（或路线 B 的 `http://IP:8788/webhook`）；
-   - Token、EncodingAESKey 填与 `.env` 中完全一致的值（若后台随机生成了一版，反过来把后台的值复制进 `.env`，再执行 `sudo docker compose restart`（Docker）或 `sudo systemctl restart wecom-ai-bot`（systemd）也可以）；
+   - Token、EncodingAESKey 填与 `.env` 中完全一致的值（若后台随机生成了一版，反过来把后台的值复制进 `.env`，再执行 `sudo docker compose up -d --force-recreate`（Docker）或 `sudo systemctl restart wecom-ai-bot`（systemd）也可以）；
    - 点「保存/验证」，企业微信会向 URL 发一条加密的验证请求，本服务解密 echostr 并回传，通过即配置成功。
 2. **接待方式**：进入客服账号详情，把接待方式设为「**回调/API 接入**」，否则消息会进人工接待队列，AI 不会回复。
 3. **可信 IP**：在该 Secret 的「企业可信 IP」配置里，填入**服务器的公网 IP**（不是内网 IP）。不填的话服务调用微信客服 API 会报 `errcode 60020`。服务器公网 IP 可用下面命令确认：
@@ -328,7 +330,7 @@ sudo systemctl restart wecom-ai-bot
 journalctl -u wecom-ai-bot -f
 ```
 
-零依赖、无构建步骤（Docker 构建也只是拷文件），restart 即生效。注意：会话上下文存内存，重启会清空（见 README「已知边界」），发布窗口避开有人正在对话即可。
+零依赖、无构建步骤（Docker 构建也只是拷文件），restart 即生效。注意：会话、游标和待发回复保存在 SQLite；更新前备份数据库，不要删除数据卷。Docker 修改代码后需 `docker compose up -d --build`，修改 .env 后需重新创建容器。
 
 ## 10. 常见故障排查
 
@@ -342,3 +344,54 @@ journalctl -u wecom-ai-bot -f
 | 收到消息但没回复 | 看 `docker compose logs -f`（Docker）或 `journalctl -f`（systemd）里 sync_msg / llm 的报错；LLM 401/404 多为 API Key、`LLM_BASE_URL`、`LLM_MODEL` 配置错误 |
 | 回复延迟数秒 | 正常现象：链路是「回调通知 → sync_msg 拉取 → 调模型 → send_msg 补发」的异步流程（见 README「常见问题」），几秒内属正常范围 |
 | 证书到期回调失败 | certbot 自动续期失败，手动 `sudo certbot renew` 并确认 80 端口安全组放行 |
+
+
+## 9. 无域名时的公网 IP 联调
+
+可以先部署 IP 入口，是否接受 IP/HTTP 以目标账号的「微信客服 → API」回调验证结果为准；若后台明确要求域名或 HTTPS，再补齐对应资源。不要将普通 HTTP 服务地址直接写成 https。
+
+本项目 Compose 将 8788 绑定到服务器回环地址。安装 Nginx 后在独立站点中配置（替换实际公网 IP，避免与已有站点冲突）：
+
+```nginx
+server {
+    listen 80;
+    server_name 你的公网IP;
+    client_max_body_size 64k;
+    location = /webhook {
+        proxy_pass http://127.0.0.1:8788;
+        proxy_set_header Host $host;
+        proxy_read_timeout 10s;
+    }
+    location / { return 404; }
+}
+```
+
+运行 `nginx -t` 后 reload；安全组和防火墙放通 80，回调地址填 `http://你的公网IP/webhook`。服务器必须能出站访问企业微信与方舟 HTTPS API，可信 IP 填实际出口公网 IP（有 NAT 时可能与入站地址不同）。healthz 通过服务器本地 `curl http://127.0.0.1:8788/healthz` 检查即可。
+
+## 10. SQLite 运维与恢复
+
+无需购买云数据库，Node 24 内置 SQLite。仅运行一个服务进程/副本。Docker 使用命名卷 `bot-data`，systemd 默认写 `/opt/wecom-ai-bot/data/bot.sqlite`；运行用户必须有目录写权限。目录保存聊天文本与文件引用，请限制备份权限。
+
+默认保留 30 天未活跃会话及完成/失败消息，定期清理；当天请求额度按 UTC 日期计算。等待处理的任务不按保留期清理。远端方舟文件生命周期由服务端管理，本地 /reset 不会删除远端文件。
+
+**一致性备份（短暂停服）**：
+
+```bash
+mkdir -p backups
+chmod 700 backups
+backup_dir="backups/$(date +%Y%m%d-%H%M%S)"
+mkdir "$backup_dir"
+sudo docker compose stop
+sudo docker compose cp wecom-ai-bot:/app/data/. "$backup_dir/"
+sudo docker compose start
+```
+
+复制整个数据目录，包含可能存在的 WAL/SHM；不要运行中仅复制主数据库。systemd 同样先 stop，再复制整个 data 目录后 start。备份应存放到服务器以外的位置。
+
+**恢复**：先 stop；保留当前 data 目录副本，在停止状态下用同一次备份的完整文件集合替换卷/目录内容，避免混用旧 WAL；Docker 确保 UID/GID 为 1000:1000（镜像 node 用户），systemd 确保归属 wecomb；启动后检查 healthz 与消息恢复。不要执行 `docker compose down -v`，该命令会删除数据卷。
+
+状态检查可在本机执行 `node scripts/status.ts`（Docker：`docker compose exec wecom-ai-bot node scripts/status.ts`）。只输出任务计数、最老待处理年龄和待同步账号数，不输出密钥或用户消息。`healthz` 只检测 HTTP 进程存活，不代表上游接口可用。
+
+临时发送故障最多重试 MAX_SEND_ATTEMPTS 次；失败任务保留以供排查。修正凭证/网络后，可用 `node scripts/retry-failed.ts <任务ID>` 重新发送失败任务的剩余分片（不重新调用模型）。此操作可能重复投递已经被微信接受、但本地未记录成功的分片。
+
+更新到新数据库版本前先备份。程序拒绝打开高于自身版本的数据库；不要直接用旧镜像覆盖新数据库，需要回滚镜像时使用兼容版本或恢复迁移前备份。

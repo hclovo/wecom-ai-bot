@@ -1,3 +1,4 @@
+import { requestBytes, requestJson } from './http-client.ts';
 // 微信客服（kf）服务端 API 封装：access_token、同步消息、发送消息
 // 文档：https://developer.work.weixin.qq.com/document/path/94670
 
@@ -6,22 +7,29 @@ export interface WecomApiConfig {
   apiBase: string;
   corpId: string;
   kfSecret: string;
+  upstreamTimeoutMs?: number;
+  fileMaxMb?: number;
+  mediaPath?: string;
 }
 
 const TOKEN_RENEW_MARGIN_MS = 5 * 60 * 1000;
-let tokenCache: { token: string | null; expiresAt: number } = { token: null, expiresAt: 0 };
+const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 
 export function clearTokenCache(): void {
-  tokenCache = { token: null, expiresAt: 0 };
+  tokenCache.clear();
 }
 
-async function getAccessToken({ apiBase, corpId, kfSecret }: WecomApiConfig): Promise<string> {
-  if (tokenCache.token && Date.now() < tokenCache.expiresAt) return tokenCache.token;
+async function getAccessToken(cfg: WecomApiConfig): Promise<string> {
+  const { apiBase, corpId, kfSecret } = cfg;
+  const key = JSON.stringify([apiBase, corpId, kfSecret]);
+  const cached = tokenCache.get(key);
+  if (cached && Date.now() < cached.expiresAt) return cached.token;
   const url = `${apiBase}/cgi-bin/gettoken?corpid=${encodeURIComponent(corpId)}&corpsecret=${encodeURIComponent(kfSecret)}`;
-  const data = await httpJson(url);
+  const data = await httpJson(cfg, url);
   if (data.errcode !== 0) throw new WecomApiError('gettoken', data);
-  tokenCache = { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 - TOKEN_RENEW_MARGIN_MS };
-  return tokenCache.token as string;
+  if (typeof data.access_token !== 'string') throw new Error('无效 access_token 响应');
+  tokenCache.set(key, { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 - TOKEN_RENEW_MARGIN_MS });
+  return data.access_token;
 }
 
 export class WecomApiError extends Error {
@@ -29,21 +37,19 @@ export class WecomApiError extends Error {
   errmsg: string | undefined;
 
   constructor(api: string, data: { errcode: number; errmsg?: string }) {
-    super(`${api} 失败: errcode=${data.errcode} errmsg=${data.errmsg}`);
+    super(`${api} 失败: errcode=${data.errcode}`);
     this.name = 'WecomApiError';
     this.errcode = data.errcode;
     this.errmsg = data.errmsg;
   }
 }
 
-async function httpJson(url: string, body?: unknown): Promise<any> {
-  const res = await fetch(url, {
+async function httpJson(cfg: WecomApiConfig, url: string, body?: unknown): Promise<any> {
+  return requestJson(url, {
     method: body ? 'POST' : 'GET',
     headers: body ? { 'content-type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) throw new Error(`${url} HTTP ${res.status}: ${await res.text()}`);
-  return res.json();
+  }, { timeoutMs: cfg.upstreamTimeoutMs });
 }
 
 async function withToken<T>(cfg: WecomApiConfig, fn: (accessToken: string) => Promise<T>): Promise<T> {
@@ -83,6 +89,7 @@ export interface WecomResponse {
 
 export interface SyncMessagesResult extends WecomResponse {
   next_cursor?: string;
+  has_more?: number;
   msg_list?: KfMessage[];
 }
 
@@ -97,8 +104,8 @@ export interface SyncMessagesOptions {
 export function syncMessages(cfg: WecomApiConfig, { cursor = '', token = '', limit = 1000, openKfId = '' }: SyncMessagesOptions): Promise<SyncMessagesResult> {
   return withToken(cfg, async (accessToken) => {
     const body: { cursor: string; limit: number; open_kfid?: string; token?: string } = { cursor, limit, open_kfid: openKfId || undefined };
-    if (cursor === '' && token) body.token = token;
-    const data: SyncMessagesResult = await httpJson(`${cfg.apiBase}/cgi-bin/kf/sync_msg?access_token=${accessToken}`, body);
+    if (token) body.token = token;
+    const data: SyncMessagesResult = await httpJson(cfg, `${cfg.apiBase}/cgi-bin/kf/sync_msg?access_token=${accessToken}`, body);
     if (data.errcode !== 0) throw new WecomApiError('sync_msg', data);
     return data;
   });
@@ -113,7 +120,7 @@ export interface SendTextOptions {
 
 export function sendText(cfg: WecomApiConfig, { touser, openKfId, msgid, content }: SendTextOptions): Promise<WecomResponse> {
   return withToken(cfg, async (accessToken) => {
-    const data: WecomResponse = await httpJson(`${cfg.apiBase}/cgi-bin/kf/send_msg?access_token=${accessToken}`, {
+    const data: WecomResponse = await httpJson(cfg, `${cfg.apiBase}/cgi-bin/kf/send_msg?access_token=${accessToken}`, {
       touser,
       open_kfid: openKfId,
       msgid,
@@ -125,20 +132,21 @@ export function sendText(cfg: WecomApiConfig, { touser, openKfId, msgid, content
   });
 }
 
-// 下载客户发来的媒体文件（图片/文件的 media_id 均来自 sync_msg 的消息体）
-// 文档：微信客服「获取媒体文件」GET /cgi-bin/kf/media/get，成功返回二进制流，失败返回 JSON
+// Media route is configurable for API compatibility; validate against the target account.
 export async function getMedia(cfg: WecomApiConfig, mediaId: string): Promise<Buffer> {
-  const accessToken = await getAccessToken(cfg);
-  const res = await fetch(`${cfg.apiBase}/cgi-bin/kf/media/get?access_token=${accessToken}&media_id=${encodeURIComponent(mediaId)}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (!res.ok) {
-    try {
-      const data = JSON.parse(buf.toString('utf8'));
-      if (data && typeof data.errcode === 'number') throw new WecomApiError('media_get', data);
-    } catch (err) {
-      if (err instanceof WecomApiError) throw err;
+  return withToken(cfg, async (accessToken) => {
+    const { bytes, contentType } = await requestBytes(
+      `${cfg.apiBase}${cfg.mediaPath || '/cgi-bin/media/get'}?access_token=${encodeURIComponent(accessToken)}&media_id=${encodeURIComponent(mediaId)}`,
+      {}, { timeoutMs: cfg.upstreamTimeoutMs, maxBytes: (cfg.fileMaxMb ?? 20) * 1024 * 1024 },
+    );
+    // Successful .json files are allowed; only an API-shaped error envelope is rejected.
+    if (contentType.includes('json') || bytes.subarray(0, 1).toString() === '{') {
+      let data: { errcode?: number; errmsg?: string } | undefined;
+      try { data = JSON.parse(bytes.toString('utf8')); } catch { /* binary / ordinary file */ }
+      if (data && typeof data.errcode === 'number' && data.errcode !== 0 && typeof data.errmsg === 'string') {
+        throw new WecomApiError('media_get', { errcode: data.errcode, errmsg: data.errmsg });
+      }
     }
-    throw new Error(`media_get HTTP ${res.status}（media_id=${mediaId.slice(0, 12)}…）`);
-  }
-  return buf;
+    return bytes;
+  });
 }
