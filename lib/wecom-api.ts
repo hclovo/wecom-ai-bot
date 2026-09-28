@@ -118,6 +118,21 @@ export interface SendTextOptions {
   content: string;
 }
 
+// Read-only: querying a session must never take it away from a human servicer.
+export function getServiceState(cfg: WecomApiConfig, openKfId: string, externalUserId: string): Promise<number> {
+  return withToken(cfg, async (accessToken) => {
+    const data = await httpJson(cfg, `${cfg.apiBase}/cgi-bin/kf/service_state/get?access_token=${accessToken}`, {
+      open_kfid: openKfId,
+      external_userid: externalUserId,
+    });
+    if (data.errcode !== 0) throw new WecomApiError('service_state/get', data);
+    if (!Number.isInteger(data.service_state) || data.service_state < 0 || data.service_state > 4) {
+      throw new Error('无效会话状态响应');
+    }
+    return data.service_state;
+  });
+}
+
 export function sendText(cfg: WecomApiConfig, { touser, openKfId, msgid, content }: SendTextOptions): Promise<WecomResponse> {
   return withToken(cfg, async (accessToken) => {
     const data: WecomResponse = await httpJson(cfg, `${cfg.apiBase}/cgi-bin/kf/send_msg?access_token=${accessToken}`, {

@@ -345,7 +345,8 @@ journalctl -u wecom-ai-bot -f
 | 回调验证失败 / `errcode 40029` / 验签失败 | `.env` 里的 `WECOM_TOKEN`、`WECOM_ENCODING_AES_KEY` 与企业微信后台配置不一致；改完任一侧后需重启服务并重试验证。若仍失败，确认 `WECOM_CORP_ID` 正确（解密校验 receiveId 用） |
 | 公网访问不通 / 回调超时 | 云**安全组**未放行 80/443（路线 A）或 8788（路线 B）；服务器本机 ufw 未放行；nginx 未启动或 `nginx -t` 报错。逐步排查：本机 `/healthz` → 公网 `curl /healthz` → 后台验证 |
 | 服务起了但马上退出 | Docker 路线 `sudo docker compose logs --since 5m`、systemd 路线 `journalctl -u wecom-ai-bot -n 50` 看报错；常见为 `.env` 缺项（容器日志会打印「缺少配置: …」）、`.env` 不在 compose.yaml 同目录 |
-| 回调验证通过但收不到消息 | 客服账号的**接待方式**未设为「回调/API 接入」，消息进了人工队列；或 `.env` 里 `WECOM_OPEN_KFID` 过滤掉了该客服账号 |
+| 回调验证通过但收不到消息 | 检查「通过 API 管理会话消息 → 企业内部开发」中，调用 API 的自建应用是否已关联目标客服账号，以及 `.env` 中 `WECOM_OPEN_KFID` 是否过滤掉了该账号 |
+| `[send] WECOM_95018 FAILED` | 查看紧随其后的 `[send-diagnosis]`：`service_state=2/3` 为人工排队/接待，`4` 为已结束或未开始；`0/1` 需进一步核对 48 小时窗口和发送时的状态变化。状态是在失败后查询，不能代表发送瞬间。`UNKNOWN` 时按 `query_error` 排查查询失败。诊断只读，不会切换接待状态；已失败的回复不会自动重发，处理原因后请客户发送新消息测试 |
 | 收到消息但没回复 | 看 `docker compose logs -f`（Docker）或 `journalctl -f`（systemd）里 sync_msg / llm 的报错；LLM 401/404 多为 API Key、`LLM_BASE_URL`、`LLM_MODEL` 配置错误 |
 | 回复延迟数秒 | 正常现象：链路是「回调通知 → sync_msg 拉取 → 调模型 → send_msg 补发」的异步流程（见 README「常见问题」），几秒内属正常范围 |
 | 证书到期回调失败 | certbot 自动续期失败，手动 `sudo certbot renew` 并确认 80 端口安全组放行 |

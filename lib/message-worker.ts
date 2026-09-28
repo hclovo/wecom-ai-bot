@@ -3,6 +3,7 @@ import type { DatabaseConfig, Job } from './message-store.ts';
 import { syncMessages, sendText } from './wecom-api.ts';
 import type { KfMessage, WecomApiConfig } from './wecom-api.ts';
 import { errorCode, retryable } from './http-client.ts';
+import { diagnoseSendFailure } from './send-diagnostics.ts';
 
 export interface WorkerConfig extends WecomApiConfig, DatabaseConfig { maxConcurrentJobs: number; maxQueueSize: number; dailyRequestLimit: number;
   syncPollMs: number; retryBaseMs: number; maxSendAttempts: number; retentionDays: number;
@@ -150,6 +151,8 @@ export class MessageWorker {
       const terminal = !retryable(error) || job.attempts + 1 >= this.cfg.maxSendAttempts;
       console.error('[send]', errorCode(error), terminal ? 'FAILED' : 'RETRY');
       await this.store.defer(job, this.delay(job.attempts), terminal);
+      const diagnosis = await diagnoseSendFailure(this.cfg, error, job.kfid, user);
+      if (diagnosis) console.error('[send-diagnosis]', diagnosis);
     }
   }
   async stop(): Promise<void> {
