@@ -490,6 +490,7 @@ export async function main(): Promise<void> {
     deadline.unref();
     void server.stopWorker().then(() => { clearTimeout(deadline); });
   };
+  server.worker.store.ownershipSignal.addEventListener('abort', () => { process.exitCode = 1; shutdown(); }, { once: true });
   process.once('SIGTERM', shutdown);
   process.once('SIGINT', shutdown);
   server.listen(cfg.port, () => {

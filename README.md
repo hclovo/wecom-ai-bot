@@ -2,25 +2,28 @@
 
 通过企业微信「微信客服」让微信好友扫码与 AI 对话。支持文本多轮、图片、PDF 和文本文件，方舟文档理解使用 Files + Responses API。**Word/Excel/PPT 目前需先导出 PDF**，不直接上传 Office 文件。
 
-Node ≥ 24.0，TypeScript 源码直接运行，无额外运行时 npm 依赖。SQLite 使用 Node 内置模块。单机、单进程部署，不支持多个进程共享同一数据库。
+Node ≥ 24.0，TypeScript 源码直接运行，使用 `pg` 驱动连接 PostgreSQL（本地验证版本 17）。同一数据库 schema 仅允许一个机器人进程，启动时通过数据库锁强制执行。当前不使用 SQLite。
 
-[需求](REQUIREMENTS.md) ｜ [进度](PROGRESS.md) ｜ [部署与 IP 联调](DEPLOY.md)
+[启动指南 START.md](START.md) ｜ [需求](REQUIREMENTS.md) ｜ [进度](PROGRESS.md) ｜ [部署与 IP 联调](DEPLOY.md)
 
 ## 运行
 
 ```bash
 cp .env.example .env
-# 填写企业微信及方舟配置
+# 填写企业微信、方舟及 DATABASE_URL
+npm ci --omit=dev
 npm start
 ```
 
-开发验证：`npm ci`、`npm test`、`npm run typecheck`。
+开发验证：`npm ci`、`TEST_DATABASE_URL=postgresql://... npm test`、`npm run typecheck`。测试使用独立随机 schema，不会回退到生产 DATABASE_URL。
 
-服务器推荐 Docker：
+连接已有 PostgreSQL 的 Docker 部署：
 
 ```bash
 docker compose up -d --build
 ```
+
+也可使用启动脚本：`./start.sh` 前台运行，`./start.sh docker` 后台运行应用容器。只需编辑 `.env`，详见 [START.md](START.md)。PostgreSQL 由你自行部署，本仓库不提供数据库部署文件。
 
 Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已有域名时使用 `https://你的域名/webhook`。无域名可先准备 `http://服务器公网IP/webhook` 联调，以微信客服后台是否接受该地址为准，详见 DEPLOY 第 9 节。
 
@@ -45,9 +48,9 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 
 ## 消息可靠性与资源限制
 
-回调验签、解密、receiveId 校验及账号过滤后，先持久化同步任务再 ack。同步按 has_more 分页，消息与游标在同一事务落盘。不同好友默认并发 2，同一好友的消息及命令按序处理。
+回调验签、解密、receiveId 校验及账号过滤后，先持久化同步任务再 ack；数据库失败返回 503，超过 4.5 秒也返回 503，允许微信重试。同步按 has_more 分页，消息与游标在同一事务落盘。不同好友默认并发 2，同一好友的消息及命令按序处理。
 
-回复先写 SQLite，再逐片发送；临时发送失败有限重试，重启继续未发送片段，不重新调用模型。进程仍在运行时，保存答案失败只重试存储；若模型服务端成功后进程在结果落盘前退出，仍可能重复调用。发送成功但本地未记账的故障窗口也可能重复投递，不承诺 exactly-once。
+回复先写 PostgreSQL，再逐片发送；临时发送失败有限重试，重启继续未发送片段，不重新调用模型。进程仍在运行时，保存答案失败只重试存储；若模型服务端成功后进程在结果落盘前退出，仍可能重复调用。发送成功但本地未记账的故障窗口也可能重复投递，不承诺 exactly-once。
 
 默认每日每个账号/好友组合限 100 个请求（UTC 零点刷新，指令免费；失败模型请求也计一次），总待处理上限 1000；队列满时暂停拉取、不推进游标。媒体流式限 20MB、回调体限 64KB，上游请求默认 30 秒超时，PDF 上传/轮询/问答另有总时限 90 秒。
 
@@ -59,11 +62,11 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 |---|---|
 | 微信图片原件 | 临时下载到内存并发送视觉模型，本地不保存原件 |
 | PDF 原件 | 临时内存 → 方舟 Files API 托管，本地保存 file_id 和文件名 |
-| 文本文件 | SQLite 中保存最多 4 万字符及文件名 |
-| 聊天历史、会话、同步游标、限额 | 本机 SQLite |
-| 待发回复 | SQLite outbox；已确认发送的分片清除正文 |
+| 文本文件 | PostgreSQL 中保存最多 4 万字符及文件名 |
+| 聊天历史、会话、同步游标、限额 | 本机 PostgreSQL |
+| 待发回复 | PostgreSQL outbox；已确认发送的分片清除正文 |
 
-无需额外对象存储或数据库服务。默认 `./data/bot.sqlite`，Docker 使用 `/app/data/bot.sqlite` 命名卷。数据库含用户文本，备份需限制权限。默认清理 30 天未活跃会话及完成/失败任务；正在排队的任务保留。文本删除是逻辑删除，不承诺 SQLite 页或既有备份的物理擦除。
+无需额外对象存储；需要连接你已有的 PostgreSQL 数据库。通过 `DATABASE_URL` 连接，默认在 `wecom_bot` schema 中建表。数据库部署和数据目录由你现有的数据库服务管理。数据库含用户文本，备份需限制权限。默认清理 30 天未活跃会话及完成/失败任务；正在排队的任务保留。文本删除是逻辑删除，不承诺数据库物理页或既有备份的擦除。
 
 方舟文件过期后需重新发送；`/reset` 与 `/del` 清除本地会话，不删除方舟托管文件。如果未来需要长期保留原件及自动重新上传，再接入对象存储。
 
@@ -79,6 +82,11 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 
 ## 实现与验证边界
 
-本地测试和类型检查通过；尚未完成真实企业微信/方舟/云服务器联调。媒体默认路径为 `/cgi-bin/media/get`，可通过 `WECOM_MEDIA_PATH` 调整，需在目标账号核验。Office 转换与语音为待办。
+真实 PostgreSQL 17 上的 28 项本地测试和类型检查通过；尚未完成真实企业微信/方舟/云服务器联调。媒体默认路径为 `/cgi-bin/media/get`，可通过 `WECOM_MEDIA_PATH` 调整，需在目标账号核验。Office 转换与语音为待办。
 
-方舟上传参数使用 `purpose=user_data`，文档输入限制依据 [Files API 官方说明](https://docs.volcengine.com/docs/ark/file-api?lang=zh)。Node 内置 SQLite 使用基础 DatabaseSync API，参见 [Node 24 文档](https://nodejs.org/download/release/latest-v24.x/docs/api/sqlite.html)。
+方舟上传参数使用 `purpose=user_data`，文档输入限制依据 [Files API 官方说明](https://docs.volcengine.com/docs/ark/file-api?lang=zh)。PostgreSQL 事务通过单一连接执行，参见 [node-postgres 事务文档](https://node-postgres.com/features/transactions)。
+
+
+数据库配置：`DATABASE_URL` 必填；`DATABASE_SCHEMA=wecom_bot`、`DATABASE_POOL_SIZE=10`、`DATABASE_TIMEOUT_MS=2000` 可调整。schema 标识符仅允许小写字母、数字和下划线。使用直连或会话池模式，不能使用事务池模式的 PgBouncer（单实例锁属于数据库会话）。锁连接断开后主程序停止工作并退出，由 Compose/systemd 重启后恢复。
+
+旧 SQLite 文件不会读取、转换或删除；如果已有需保留的历史数据，应另行执行显式迁移。历史审查报告中的 SQLite 描述仅代表当时版本。

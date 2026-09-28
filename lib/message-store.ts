@@ -38,6 +38,8 @@ export class MessageStore {
   private owner?: PoolClient;
   private closed = false;
   private valid = true;
+  private ownership = new AbortController();
+  get ownershipSignal(): AbortSignal { return this.ownership.signal; }
   get healthy(): boolean { return this.valid && !this.closed; }
 
   private constructor(cfg: DatabaseConfig) {
@@ -62,8 +64,14 @@ export class MessageStore {
         // A dedicated session owns this lock for the entire server lifetime. A second
         // worker must not reset processing jobs or reorder work in the same schema.
         store.owner = await store.pool.connect();
-        store.owner.on('error', () => { store.valid = false; console.error('[database]', 'WORKER_LOCK_CONNECTION_LOST'); });
-        store.owner.on('end', () => { store.valid = false; });
+        const ownershipLost = () => {
+          if (store.closed || !store.valid) return;
+          store.valid = false;
+          console.error('[database]', 'WORKER_LOCK_CONNECTION_LOST');
+          store.ownership.abort();
+        };
+        store.owner.on('error', ownershipLost);
+        store.owner.on('end', ownershipLost);
         const lock = await store.owner.query<{ locked: boolean }>(
           'SELECT pg_try_advisory_lock(hashtext(current_database()), hashtext($1)) AS locked', [`wecom-ai-bot:${cfg.databaseSchema}`],
         );

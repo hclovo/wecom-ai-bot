@@ -1,3 +1,5 @@
+> 快速启动请先看 [START.md](START.md)：编辑 .env 后运行 ./start.sh 或 ./start.sh docker。PostgreSQL 由你独立部署。
+
 # 部署指南（自有云服务器）
 
 本文面向把 wecom-ai-bot 部署到一台自己的云服务器（VPS）的场景：从裸机初始化到 systemd 守护、HTTPS 暴露、企业微信侧收尾、验证与日常更新。项目介绍与架构说明见 [README.md](./README.md)，本文只讲部署落地。
@@ -8,7 +10,7 @@
 
 | 项目 | 说明 |
 |---|---|
-| 云服务器 | 1 台有**公网 IP** 的机器即可（1C1G 足够，零依赖单进程）。阿里云 / 腾讯云 / 火山引擎等均可 |
+| 云服务器 | 1 台有**公网 IP** 的机器即可（容量按机器人与数据库的实际负载配置）。阿里云 / 腾讯云 / 火山引擎等均可 |
 | 域名 | 可选但**强烈推荐**：用于 certbot 申请 HTTPS 证书。企业微信回调接受 http，但 https 更安全 |
 | 企业微信管理后台 | 能登录 [work.weixin.qq.com](https://work.weixin.qq.com)，且已注册企业、开通微信客服（步骤见 README「部署步骤」第 1 节） |
 | 大模型 API Key | 火山方舟 API Key（或任意 OpenAI 兼容接口的 Key） |
@@ -21,7 +23,7 @@
 
 ### 2.1 安装 Node 24 LTS
 
-项目零运行时依赖，只需 Node 本体。要求 Node ≥ 24.0（原生 type stripping，可直接运行 `.ts`，无需编译），建议装 Node 24 LTS。用 NodeSource 安装：
+项目使用 PostgreSQL 和 pg 驱动，需要安装 npm 生产依赖。要求 Node ≥ 24.0（原生 type stripping，可直接运行 `.ts`，无需编译），建议装 Node 24 LTS。用 NodeSource 安装：
 
 ```bash
 # 安装 NodeSource 源并安装 Node 24 LTS
@@ -54,7 +56,7 @@ sudo chown wecomb:wecomb /opt/wecom-ai-bot
 
 ## 3. 上传代码
 
-零依赖、无需 `npm install`，代码上去就能跑。二选一：
+上传代码后，systemd/直接运行需执行 `npm ci --omit=dev`；Docker 构建会自动安装生产依赖。二选一：
 
 **方式 A：git clone（推荐，便于后续更新）**
 
@@ -125,6 +127,8 @@ openssl rand -base64 32 | tr -d '=\n' | cut -c1-43   # 可用作 43 位 Encoding
 sudo chmod 600 /opt/wecom-ai-bot/.env
 sudo chown wecomb:wecomb /opt/wecom-ai-bot/.env
 ```
+
+启动前在 .env 填写 DATABASE_URL（见第 10 节）。systemd 路线需先在项目目录运行 `sudo -u wecomb npm ci --omit=dev`；Docker 路线由构建步骤完成依赖安装。
 
 ## 5. 守护进程
 
@@ -326,11 +330,12 @@ sudo docker compose logs -f            # 确认启动无报错、回调正常进
 ```bash
 cd /opt/wecom-ai-bot
 sudo -u wecomb git pull
+sudo -u wecomb npm ci --omit=dev
 sudo systemctl restart wecom-ai-bot
 journalctl -u wecom-ai-bot -f
 ```
 
-零依赖、无构建步骤（Docker 构建也只是拷文件），restart 即生效。注意：会话、游标和待发回复保存在 SQLite；更新前备份数据库，不要删除数据卷。Docker 修改代码后需 `docker compose up -d --build`，修改 .env 后需重新创建容器。
+更新前备份 PostgreSQL。systemd 代码更新后先运行 `npm ci --omit=dev` 再 restart；不要删除数据库数据卷。Docker 修改代码后需 `docker compose up -d --build`，修改 .env 后需重新创建容器。
 
 ## 10. 常见故障排查
 
@@ -368,30 +373,76 @@ server {
 
 运行 `nginx -t` 后 reload；安全组和防火墙放通 80，回调地址填 `http://你的公网IP/webhook`。服务器必须能出站访问企业微信与方舟 HTTPS API，可信 IP 填实际出口公网 IP（有 NAT 时可能与入站地址不同）。healthz 通过服务器本地 `curl http://127.0.0.1:8788/healthz` 检查即可。
 
-## 10. SQLite 运维与恢复
+## 10. PostgreSQL 配置、备份与恢复
 
-无需购买云数据库，Node 24 内置 SQLite。仅运行一个服务进程/副本。Docker 使用命名卷 `bot-data`，systemd 默认写 `/opt/wecom-ai-bot/data/bot.sqlite`；运行用户必须有目录写权限。目录保存聊天文本与文件引用，请限制备份权限。
+当前版本不使用 SQLite。需要 PostgreSQL 实例（本地验证 17），使用你已有且单独部署的数据库。本仓库不提供 PostgreSQL 部署配置。图片/PDF 原件不写 PostgreSQL，文件存放方式见 README。
 
-默认保留 30 天未活跃会话及完成/失败消息，定期清理；当天请求额度按 UTC 日期计算。等待处理的任务不按保留期清理。远端方舟文件生命周期由服务端管理，本地 /reset 不会删除远端文件。
+### 10.1 已有 PostgreSQL
 
-**一致性备份（短暂停服）**：
+为机器人准备独立数据库和账号，账号在指定 schema 中拥有建表、读写、建索引和序列权限。首次创建 schema 还需要数据库 CREATE 权限；也可以由管理员预建 `wecom_bot` schema 并将 owner 设为机器人账号。不要把生产超级用户凭证写入应用配置。
+
+```dotenv
+DATABASE_URL=postgresql://wecom_bot:URL编码后的密码@数据库地址:5432/wecom_bot
+DATABASE_SCHEMA=wecom_bot
+DATABASE_POOL_SIZE=10
+DATABASE_TIMEOUT_MS=2000
+```
+
+连接池至少 2 个连接，默认 10；其中一个连接用于单实例锁。远程数据库按提供方要求配置 TLS（例如连接串 `sslmode=verify-full` 及可信 CA），不要为了连接成功禁用证书校验。Docker 中的 127.0.0.1 指应用容器本身，请填写容器能访问的真实数据库地址。
+
+使用直连或会话级连接池；不能使用事务级 PgBouncer，因为单实例锁需要独占数据库会话。一个 schema 仅运行一个机器人进程，第二个实例会拒绝启动；锁连接断开时主进程退出，Compose/systemd 重启并恢复任务。
+
+应用启动自动建表并记录 schema_migrations，拒绝打开比自身更新的数据库。数据库不可用时不会偷偷回退 SQLite。历史 SQLite 文件不读取、不删除；已有数据需另行显式迁移。
+
+### 10.2 备份与恢复
+
+使用你数据库服务配套的备份工具，或 PostgreSQL 官方 pg_dump / pg_restore。pg_dump 可在线生成一致性快照。以下示例使用 `.pg_service.conf` 中已配置的连接别名和受限 `.pgpass`，不把密码放入命令行：
 
 ```bash
 mkdir -p backups
 chmod 700 backups
-backup_dir="backups/$(date +%Y%m%d-%H%M%S)"
-mkdir "$backup_dir"
-sudo docker compose stop
-sudo docker compose cp wecom-ai-bot:/app/data/. "$backup_dir/"
-sudo docker compose start
+umask 077
+pg_dump 'service=wecom_backup' -Fc -f backups/wecom.dump
 ```
 
-复制整个数据目录，包含可能存在的 WAL/SHM；不要运行中仅复制主数据库。systemd 同样先 stop，再复制整个 data 目录后 start。备份应存放到服务器以外的位置。
+使用带时间戳的不同文件名保存多份备份，并复制到服务器以外的位置。pg_dump 客户端版本不得低于目标服务器版本。数据库包含聊天文本和截断文件内容，限制备份的访问权限。
 
-**恢复**：先 stop；保留当前 data 目录副本，在停止状态下用同一次备份的完整文件集合替换卷/目录内容，避免混用旧 WAL；Docker 确保 UID/GID 为 1000:1000（镜像 node 用户），systemd 确保归属 wecomb；启动后检查 healthz 与消息恢复。不要执行 `docker compose down -v`，该命令会删除数据卷。
+恢复到由你预先创建的**新空数据库**验证，通过 `wecom_restore` 服务别名指定它：
 
-状态检查可在本机执行 `node scripts/status.ts`（Docker：`docker compose exec wecom-ai-bot node scripts/status.ts`）。只输出任务计数、最老待处理年龄和待同步账号数，不输出密钥或用户消息。`healthz` 只检测 HTTP 进程存活，不代表上游接口可用。
+```bash
+pg_restore --dbname='service=wecom_restore' --no-owner --exit-on-error backups/wecom.dump
+```
 
-临时发送故障最多重试 MAX_SEND_ATTEMPTS 次；失败任务保留以供排查。修正凭证/网络后，可用 `node scripts/retry-failed.ts <任务ID>` 重新发送失败任务的剩余分片（不重新调用模型）。此操作可能重复投递已经被微信接受、但本地未记录成功的分片。
+停止机器人后再修改 .env 的 DATABASE_URL 切到恢复库，核对 schema、状态统计与历史记录后启动。恢复旧备份可能重发备份之后已发送的消息，需要检查待发队列。备份、数据库创建、角色授权及存储目录均由你现有的 PostgreSQL 部署负责。
 
-更新到新数据库版本前先备份。程序拒绝打开高于自身版本的数据库；不要直接用旧镜像覆盖新数据库，需要回滚镜像时使用兼容版本或恢复迁移前备份。
+升级前备份；回滚应用镜像前确认 schema 版本兼容，不兼容时恢复迁移前备份到新库后切换。旧 SQLite 文件不会被读取、转换或删除，不自动迁移历史数据。
+
+### 10.3 状态与失败重发
+
+本机运行 `node scripts/status.ts`，或 Docker 中执行：
+
+```bash
+docker compose exec wecom-ai-bot node scripts/status.ts
+docker compose exec wecom-ai-bot node scripts/retry-failed.ts <任务ID>
+```
+
+管理命令不会重置进行中的任务或运行 schema 迁移；状态命令仅输出计数和任务 ID。永久失败先排查权限/接口限制，临时失败超过 MAX_SEND_ATTEMPTS 后也会进入 failed。手动重发只重发剩余分片，不重新调用模型，但可能重复投递微信已接收而本地尚未记账的片段。
+
+默认保留 30 天未活跃会话及完成/失败任务，等待中的任务不清理。数据库包含用户文本，限制账号权限与备份访问。healthz 只表示 HTTP 进程存活；数据库错误日志仅记录阶段码，不打印连接串、密码或 SQL 参数。
+
+## 11. 本地 PostgreSQL 回归测试
+
+`npm test` 需要独立的 TEST_DATABASE_URL，**不会使用生产 DATABASE_URL**。测试在随机 `test_wecom_*` schema 中建表，结束后只清理自身创建的 schema。测试账号需要 CREATE schema；测试实例应与生产隔离。实例锁断开测试还会终止测试账号自己的锁连接。
+
+先准备一个独立测试数据库并授予测试账号 CREATE schema 权限，然后运行：
+
+```bash
+npm ci
+# 使用自己的测试数据库地址；不要填写生产数据库
+TEST_DATABASE_URL=postgresql://测试用户名:编码后的密码@测试数据库地址:5432/测试库 npm test
+npm run typecheck
+```
+
+当前覆盖真实 PostgreSQL 的事务回滚、并发额度、幂等提交、重启续发、实例锁与版本保护，微信/方舟仍使用 mock。云端联调与真实模型计费验证仍需另外执行。
+
+参考：[node-postgres 事务](https://node-postgres.com/features/transactions)、[PostgreSQL advisory lock](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS)。
