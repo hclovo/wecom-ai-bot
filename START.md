@@ -148,3 +148,5 @@ docker compose exec wecom-ai-bot node scripts/diagnose-cursor-image.ts
 命令使用相同的 Cursor 配置和一个固定的小猫提示，可能消耗一次生图额度，不连接数据库或发送微信消息。输出 CLI 版本、选用模型、事件类型数量、工具名称和截断脱敏的最终回复。将这些诊断结果用于区分模型未调用、工具不可用、权限提示、额度提示与事件格式不兼容；`responseHint` 只是对模型文字的分类，不是服务端权威错误码。普通聊天失败日志只打印 `[cursor-image-diagnosis]` 元数据，不打印模型回复或用户内容。
 
 原生生图诊断的 `imageTools` 字段包含 GenerateImage 完成事件的状态、结果字段名和脱敏错误正文。普通日志只记录 `imageResults` 的状态与权限关键词标记，不打印工具错误正文；定位失败时应优先看 `imageTools[].error`，不要只凭模型最终解释判断原因。
+
+若旧版出现 `Failed to save generated image ... Blocked by permissions configuration`，更新代码并重建即可使用独立绘图权限配置。无需删除 cursor-state 卷或手工清空共享权限：绘图调用会从已有登录配置创建临时副本，放行本次 assets 输出目录，并在结束后删除副本；聊天仍禁止写入。
