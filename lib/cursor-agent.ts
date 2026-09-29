@@ -11,7 +11,7 @@ const MAX_OUTPUT = 2 * 1024 * 1024;
 const activeRequests = new Set<() => void>();
 export function cancelCursorRequests(): void { for (const cancel of activeRequests) cancel(); }
 export class CursorAgentError extends Error {
-  constructor(code: 'CURSOR_NOT_INSTALLED' | 'CURSOR_TIMEOUT' | 'CURSOR_OUTPUT_INVALID' | 'CURSOR_PROCESS_FAILED' | 'CURSOR_IMAGE_MISSING' | 'CURSOR_IMAGE_NOT_CALLED' | 'CURSOR_IMAGE_TOOL_FAILED') { super(code); this.name = code; }
+  constructor(code: 'CURSOR_NOT_INSTALLED' | 'CURSOR_TIMEOUT' | 'CURSOR_OUTPUT_INVALID' | 'CURSOR_PROCESS_FAILED' | 'CURSOR_IMAGE_MISSING' | 'CURSOR_IMAGE_NOT_CALLED' | 'CURSOR_IMAGE_TOOL_FAILED' | 'CURSOR_IMAGE_RESULT_UNRECOGNIZED') { super(code); this.name = code; }
 }
 
 // Native GenerateImage has its own permission, independent of text-file writes.
@@ -32,8 +32,9 @@ export async function cursorGenerateImage(options: CursorOptions & { prompt: str
     try { return await readGeneratedImage(output, workspace); }
     catch (error) {
       // Normal chat logs include metadata only, never model prose or user content.
-      const { finalReply, toolDiscovery, ...metadata } = diagnostic;
-      console.error('[cursor-image-diagnosis]', JSON.stringify(metadata));
+      const { finalReply, toolDiscovery, imageTools, ...metadata } = diagnostic;
+      const imageResults = imageTools.map(({ status, error, resultFields }) => ({ status, resultFields, permissionDenied: /permission|EACCES|EPERM|权限|拒绝访问/i.test(error) }));
+      console.error('[cursor-image-diagnosis]', JSON.stringify({ ...metadata, imageResults }));
       throw error;
     }
   } finally { await rm(workspace, { recursive: true, force: true }); }
@@ -50,6 +51,7 @@ export interface ImageRunDiagnostic {
   resultError: boolean;
   responseHint: 'tool_unavailable' | 'permission' | 'quota_or_billing' | 'unspecified';
   finalReply: string;
+  imageTools: Array<{ status: string; error: string; resultFields: string[] }>;
   toolDiscovery: Array<{ query: string; status: string; response: string }>;
 }
 
@@ -65,6 +67,7 @@ export function imageRunDiagnostic(output: string): ImageRunDiagnostic {
   const events: Record<string, number> = Object.create(null);
   const names = new Set<string>();
   const toolDiscovery: ImageRunDiagnostic['toolDiscovery'] = [];
+  const imageTools: ImageRunDiagnostic['imageTools'] = [];
   let final: Record<string, any> | undefined;
   let assistantText = '';
   const label = (value: unknown) => typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(value) ? value : 'unknown';
@@ -83,6 +86,15 @@ export function imageRunDiagnostic(output: string): ImageRunDiagnostic {
     if (envelope?.tool?.case) names.add(label(envelope.tool.case));
     else for (const key of Object.keys(envelope || {})) if (/tool_?call$/i.test(key)) names.add(label(key));
     if (!envelope) names.add('unknown');
+    const image = record(envelope?.generateImageToolCall) || (envelope?.tool?.case === 'generateImageToolCall' ? record(envelope.tool.value) : undefined);
+    if (image && event.subtype === 'completed' && imageTools.length < 8) {
+      const result = record(image.result);
+      const success = record(result?.success) || (result?.result?.case === 'success' ? record(result.result.value) : undefined);
+      const failure = record(result?.error) || (result?.result?.case === 'error' ? record(result.result.value) : undefined);
+      imageTools.push({ status: success ? 'success' : failure ? 'error' : 'unrecognized',
+        error: typeof failure?.error === 'string' ? diagnosticText(failure.error) : '',
+        resultFields: Object.keys(result || {}).map(label).slice(0, 12) });
+    }
     const lookup = record(envelope?.getMcpToolsToolCall) || (envelope?.tool?.case === 'getMcpToolsToolCall' ? record(envelope.tool.value) : undefined);
     if (lookup && event.subtype === 'completed' && toolDiscovery.length < 4) {
       const result = record(lookup.result);
@@ -101,7 +113,7 @@ export function imageRunDiagnostic(output: string): ImageRunDiagnostic {
     : /not available|unavailable|do not have|don't have|no access|无法调用|没有.*工具|不支持|不可用/i.test(text) ? 'tool_unavailable' : 'unspecified';
   // Exposed only by the explicit diagnostic script's fixed, non-user prompt.
   const finalReply = diagnosticText(text);
-  return { events, tools: [...names].slice(0, 32), resultPresent: !!final, resultError: !!final?.is_error, responseHint, finalReply, toolDiscovery };
+  return { events, tools: [...names].slice(0, 32), resultPresent: !!final, resultError: !!final?.is_error, responseHint, finalReply, toolDiscovery, imageTools };
 }
 
 export async function cursorVersion(options: CursorOptions): Promise<string> {
@@ -116,6 +128,7 @@ export async function cursorVersion(options: CursorOptions): Promise<string> {
 export async function readGeneratedImage(output: string, workspace: string): Promise<Buffer> {
   let final: Record<string, any> | undefined;
   let called = false;
+  let failed = false;
   const successes: Record<string, any>[] = [];
   for (const line of output.split('\n').filter(line => line.trim())) {
     let event: Record<string, any> | undefined;
@@ -131,10 +144,11 @@ export async function readGeneratedImage(output: string, workspace: string): Pro
     const result = record(tool.result);
     const success = record(result?.success) || (result?.result?.case === 'success' ? record(result.result.value) : undefined);
     if (success) successes.push(success);
+    if (record(result?.error) || result?.result?.case === 'error') failed = true;
   }
   if (!final || final.is_error || (final.subtype && final.subtype !== 'success')) throw new CursorAgentError('CURSOR_OUTPUT_INVALID');
   if (!called) throw new CursorAgentError('CURSOR_IMAGE_NOT_CALLED');
-  if (!successes.length) throw new CursorAgentError('CURSOR_IMAGE_TOOL_FAILED');
+  if (!successes.length) throw new CursorAgentError(failed ? 'CURSOR_IMAGE_TOOL_FAILED' : 'CURSOR_IMAGE_RESULT_UNRECOGNIZED');
   for (const success of successes) {
     const encoded = success.imageData ?? success.image_data;
     if (typeof encoded === 'string' && encoded.length) {

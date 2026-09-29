@@ -172,6 +172,7 @@ test('native image tool stream handles inline data, actual artifact paths and ex
     assert.deepEqual(await readGeneratedImage(stream(completed({ success: { filePath: 'assets/actual.webp' } })), dir), bytes);
     await assert.rejects(readGeneratedImage(stream(), dir), /CURSOR_IMAGE_NOT_CALLED/);
     await assert.rejects(readGeneratedImage(stream(completed({ error: { error: 'private provider error' } })), dir), /CURSOR_IMAGE_TOOL_FAILED/);
+    await assert.rejects(readGeneratedImage(stream(completed({ otherResult: {} })), dir), /CURSOR_IMAGE_RESULT_UNRECOGNIZED/);
     for (const filePath of ['/etc/passwd', '../secret.png', 'https://example.com/image.png']) {
       await assert.rejects(readGeneratedImage(stream(completed({ success: { filePath } })), dir), /CURSOR_IMAGE_MISSING/);
     }
@@ -208,4 +209,9 @@ test('image diagnostics distinguish event shapes and expose only metadata in nor
     getMcpToolsToolCall:{args:{pattern:'GenerateImage'},result:{success:{content:'No matching tools. https://secret.test/?token=abc'}}},
   }}));
   assert.deepEqual(discovery.toolDiscovery, [{query:'GenerateImage',status:'success',response:'No matching tools. [URL]'}]);
+  const failedImage = imageRunDiagnostic(JSON.stringify({type:'tool_call',subtype:'completed',tool_call:{
+    generateImageToolCall:{args:{description:'PRIVATE_PROMPT'},result:{error:{error:'EACCES permission denied https://secret.test/?token=abc'}}},
+  }}));
+  assert.deepEqual(failedImage.imageTools, [{status:'error',error:'EACCES permission denied [URL]',resultFields:['error']}]);
+  assert.ok(!JSON.stringify(failedImage).includes('PRIVATE_PROMPT'));
 });
