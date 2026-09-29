@@ -19,7 +19,7 @@
 | 云服务器联调 | 待办 | 已有服务器，域名暂缺，可先准备 IP 入口 |
 | Office 转换、语音 | 待办 | 可靠性及真实链路验收后安排 |
 
-测试基线：**41 项通过**（包括单元、存储及 mock 端到端测试），typecheck 通过。数据库使用真实 PostgreSQL 17；微信及方舟仍为 mock。
+测试基线：**47 项通过**（包括单元、存储及 mock 端到端测试），typecheck 通过。数据库使用真实 PostgreSQL 17；微信及方舟仍为 mock。
 
 ## 2026-09-29 · SVG 绘图升级
 
@@ -29,6 +29,14 @@
 - /draw 纳入日限额；增加可选 WECOM_AUTO_TAKEOVER，仅尝试未处理会话，默认关闭。
 - 41 项本地测试通过，覆盖 SVG 安全校验、中文渲染、图片上传、限额、重试、媒体过期重传和 schema 迁移。Docker 构建及 Node 24.21.0 / UID 1000 的中文流程图渲染通过，图片约 43KB。
 - 真实微信/文本模型 SVG 输出效果仍需部署后验收，不代表已解决所有 95018。
+
+## 2026-09-29 · Cursor CLI 登录接入
+
+- 新增 LLM_PROVIDER=cursor，官方 CLI 登录链接在 start.sh 启动流程中显示；登录成功后才启动机器人，有效凭证复用。
+- 默认 CURSOR_MODEL=auto；文本、文本文件与 SVG 绘图走 CLI，图片/PDF 明确保留在 API 模式。
+- Docker 切换 Debian/glibc，安装官方 CLI，增加独立 cursor-state 数据卷；本仓库不部署 PostgreSQL。
+- 独立临时工作区、stdin 输入、只读问答模式、拒绝文件/Shell/WebFetch/MCP、环境变量白名单、超时与进程取消。
+- 47 项测试通过，typecheck、shell 语法、Compose 配置和镜像构建通过；实际账号登录和模型调用尚未验证。登录门控/调用适配使用模拟 CLI，官方 CLI 容器已确认未登录状态可正确识别。
 
 ## 执行记录（时间线）
 

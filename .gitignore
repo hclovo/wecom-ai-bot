@@ -9,3 +9,5 @@ backups/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+.cursor-agent-state/

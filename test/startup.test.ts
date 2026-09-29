@@ -34,3 +34,25 @@ test('configuration check validates fields without connecting or leaking credent
   await assert.rejects(exec(process.execPath,[resolve('scripts/check-config.ts')],{env:{...env,LLM_MODEL:'ep-2024xxxxxxxxxxxxxxxx'}}),
     (e:any)=>e.code===1 && e.stderr.includes('LLM_MODEL') && !e.stderr.includes('DO_NOT_PRINT_PASSWORD') && !e.stderr.includes('FAKE_SECRET'));
 });
+
+test('docker startup gates service launch on successful Cursor login',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wecom-login-gate-'));
+  const {writeFileSync,mkdirSync}=await import('node:fs');
+  try{
+    copyFileSync('start.sh',join(dir,'start.sh'));writeFileSync(join(dir,'.env'),'LLM_PROVIDER=cursor\n');
+    const bin=join(dir,'bin');mkdirSync(bin);
+    const calls=join(dir,'calls');
+    writeFileSync(join(bin,'docker'),`#!/usr/bin/env node
+const fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},a.join(' ')+'\\n');
+if(a.includes('scripts/cursor-login.ts') && process.env.TEST_LOGIN_FAIL==='1')process.exit(1);
+`,{mode:0o700});
+    const env={...process.env,PATH:bin+':'+process.env.PATH,TEST_LOGIN_FAIL:'1'};
+    await assert.rejects(exec('sh',[join(dir,'start.sh'),'docker'],{env}));
+    assert.ok(!readFileSync(calls,'utf8').includes('up -d'));
+    writeFileSync(calls,'');
+    await exec('sh',[join(dir,'start.sh'),'docker'],{env:{...env,TEST_LOGIN_FAIL:'0'}});
+    const steps=readFileSync(calls,'utf8');
+    assert.ok(steps.indexOf('scripts/check-config.ts')<steps.indexOf('scripts/cursor-login.ts'));
+    assert.ok(steps.indexOf('scripts/cursor-login.ts')<steps.indexOf('up -d'));
+  }finally{rmSync(dir,{recursive:true,force:true});}
+});

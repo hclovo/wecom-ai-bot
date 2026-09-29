@@ -10,7 +10,7 @@
 nano .env
 ```
 
-必须填写：
+企业微信和数据库配置必须填写；模型配置根据下面选择的模式填写：
 
 | 配置 | 填写内容 |
 |---|---|
@@ -19,9 +19,9 @@ nano .env
 | `WECOM_KF_SECRET` | 微信客服 API Secret |
 | `WECOM_TOKEN` | 企业微信回调 Token |
 | `WECOM_ENCODING_AES_KEY` | 回调 EncodingAESKey，43 位 |
-| `LLM_BASE_URL` | 模型接口地址，方舟默认为 `https://ark.cn-beijing.volces.com/api/v3` |
-| `LLM_API_KEY` | 模型 API Key |
-| `LLM_MODEL` | 文本/PDF 模型或接入点 ID |
+| `LLM_BASE_URL`（API 模式） | 模型接口地址，方舟默认为 `https://ark.cn-beijing.volces.com/api/v3` |
+| `LLM_API_KEY`（API 模式） | 模型 API Key |
+| `LLM_MODEL`（API 模式） | 文本/PDF 模型或接入点 ID |
 
 可选填写 `WECOM_OPEN_KFID` 限定客服账号、`LLM_VISION_MODEL` 指定视觉模型。数据库默认 schema 为 `wecom_bot`，可用 `DATABASE_SCHEMA` 修改。账号需能创建 schema/表，或请数据库管理员预建 schema 并授予相应权限。密码含 `@`、`:`、`/` 等字符时要 URL 编码。
 
@@ -82,3 +82,35 @@ docker compose stop wecom-ai-bot
 默认复用已配置的文本模型，不用额外生图 API。可在 .env 添加 `SVG_MODEL=同一文本接口中的模型ID` 和 `SVG_TIMEOUT_MS=120000`，不填则使用默认值。已有聊天模型需要能按提示输出完整 SVG。
 
 升级前先备份 PostgreSQL；本版自动将 schema 升至 2，保留旧文本待发记录。Docker 构建会安装 SVG 渲染依赖和中文字体。已有 95018 问题仍需根据日志的 service_state 排查，生成图片成功不代表微信一定允许发送。
+
+
+## Cursor 账号登录模式
+
+在服务器的 `.env` 中设置：
+
+```dotenv
+LLM_PROVIDER=cursor
+CURSOR_MODEL=auto
+```
+
+此模式不要求填写 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL。企业微信和 DATABASE_URL 仍需填写。SVG_MODEL 留空时也使用 CURSOR_MODEL；不要把旧的方舟接入点 ID 填到 Cursor 模型配置中。
+
+然后执行：
+
+```bash
+bash start.sh docker
+```
+
+启动流程：构建包含官方 Cursor CLI 的镜像 → 检查项目配置 → 检查 Cursor 登录 → 未登录时终端打印官方登录 URL → 在电脑浏览器打开链接、登录并授权 → CLI 确认登录成功 → 自动后台启动机器人。服务器不需要图形界面，登录使用官方 NO_OPEN_BROWSER=1 模式。
+
+不要在授权完成前关闭终端。登录失败时脚本退出，不会启动新的机器人容器。已有有效登录状态时跳过登录；Docker 重建后继续使用 `cursor-state` 命名卷中的凭证。不要删除该数据卷，否则需要重新登录。
+
+目前支持：文字多轮对话、文本文件摘要/追问、/draw SVG 绘图。图片理解和 PDF 文件问答在 Cursor 模式下会明确提示暂不支持；需要这些功能时切回 `LLM_PROVIDER=api` 并填写原 API 配置。
+
+模型调用通过 Cursor CLI `--print --mode ask --output-format json`，每条消息使用独立临时工作区，不复用其他好友的 CLI 会话。工具权限配置拒绝文件读取/写入、Shell、WebFetch 和 MCP；数据库/微信/API 密钥不传给子进程。聊天上下文仍由 PostgreSQL 管理。
+
+如果直接在宿主机启动，先按 [Cursor 官方安装说明](https://cursor.com/docs/cli/installation) 安装 CLI，再运行 `./start.sh`。本机 macOS 的认证存储由 Cursor CLI 管理，可能复用该系统用户已有的 Cursor 登录；服务器建议使用 Docker 的独立状态卷。
+
+登录过期后重新执行 `bash start.sh docker`，或单独运行 `docker compose run --rm --no-deps wecom-ai-bot node scripts/cursor-login.ts` 完成授权。模型可用性和额度以你的 Cursor 账号为准；账号登录不等于无限调用。
+
+官方依据：[登录与 NO_OPEN_BROWSER](https://prod.cursor.com/docs/cli/reference/authentication)、[命令参数](https://prod.cursor.com/docs/cli/reference/parameters)。

@@ -1,3 +1,4 @@
+import { cancelCursorRequests } from './lib/cursor-agent.ts';
 import { drawingPrompt, generateImage } from './lib/image-generation.ts';
 import http from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
@@ -16,6 +17,11 @@ import type { HistoryMessage } from './lib/llm.ts';
 // ---------- 配置 ----------
 
 export interface Config extends DatabaseConfig {
+  llmProvider: 'api' | 'cursor';
+  cursorBin: string;
+  cursorStateDir: string;
+  cursorModel: string;
+  cursorTimeoutMs: number;
   port: number;
   corpId: string;
   kfSecret: string;
@@ -57,7 +63,14 @@ export function loadEnvFile(file: string): void {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const provider = env.LLM_PROVIDER || 'api';
+  if (!['api','cursor'].includes(provider)) throw new Error('LLM_PROVIDER 必须为 api 或 cursor');
   const cfg = {
+    llmProvider: provider,
+    cursorBin: env.CURSOR_AGENT_BIN || 'cursor-agent',
+    cursorStateDir: env.CURSOR_STATE_DIR || './.cursor-agent-state',
+    cursorModel: env.CURSOR_MODEL || 'auto',
+    cursorTimeoutMs: Number(env.CURSOR_TIMEOUT_MS || 120000),
     port: Number(env.PORT || 8788),
     corpId: env.WECOM_CORP_ID,
     kfSecret: env.WECOM_KF_SECRET,
@@ -66,10 +79,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     receiveId: env.WECOM_RECEIVE_ID || env.WECOM_CORP_ID,
     apiBase: env.WECOM_API_BASE || 'https://qyapi.weixin.qq.com',
     openKfId: env.WECOM_OPEN_KFID || '', // 留空则处理所有客服账号的消息
-    llmBaseUrl: env.LLM_BASE_URL,
-    llmApiKey: env.LLM_API_KEY,
-    llmModel: env.LLM_MODEL,
-    imageModel: env.SVG_MODEL || env.LLM_MODEL,
+    llmBaseUrl: env.LLM_BASE_URL || '',
+    llmApiKey: env.LLM_API_KEY || '',
+    llmModel: env.LLM_MODEL || '',
+    imageModel: env.SVG_MODEL || (provider === 'cursor' ? (env.CURSOR_MODEL || 'auto') : env.LLM_MODEL),
     imageTimeoutMs: Number(env.SVG_TIMEOUT_MS || 120000),
     llmVisionModel: env.LLM_VISION_MODEL || env.LLM_MODEL, // 看图模型，需支持视觉
     systemPrompt: env.LLM_SYSTEM_PROMPT || '你是一位用户的好朋友，通过微信聊天。回复要口语化、简洁自然，一般不超过 150 字，不用 markdown 格式，分点列表。',
@@ -94,13 +107,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     WECOM_KF_SECRET: cfg.kfSecret,
     WECOM_TOKEN: cfg.token,
     WECOM_ENCODING_AES_KEY: cfg.aesKey,
-    LLM_BASE_URL: cfg.llmBaseUrl,
-    LLM_API_KEY: cfg.llmApiKey,
-    LLM_MODEL: cfg.llmModel,
+    ...(provider === 'api' ? { LLM_BASE_URL: cfg.llmBaseUrl, LLM_API_KEY: cfg.llmApiKey, LLM_MODEL: cfg.llmModel } : {}),
   }).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length > 0) throw new Error(`缺少配置: ${missing.join(', ')}（参考 .env.example）`);
   for (const key of ['port', 'maxTurns', 'fileMaxMb', 'upstreamTimeoutMs', 'fileTaskTimeoutMs',
-    'imageTimeoutMs', 'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
+    'imageTimeoutMs', 'cursorTimeoutMs', 'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
     if (!Number.isSafeInteger(cfg[key]) || cfg[key] < 1) throw new Error(`配置 ${key} 必须为正整数`);
   }
   if (cfg.port > 65535) throw new Error('PORT 超出范围');
@@ -266,6 +277,7 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
   // 首条消息给默认命名的会话起标题
   if (conv.title === '闲聊' && conv.history.length === 0) conv.title = content.slice(0, 12);
   if (conv.pendingFile) {
+    if (cfg.llmProvider === 'cursor') return '当前 Cursor 模式暂不支持之前的 PDF 追问。请发 /reset 开始文字对话，或切回 API 模式。';
     const { fileId, filename } = conv.pendingFile;
     const answer = await askFile({
       timeoutMs: cfg.upstreamTimeoutMs,
@@ -280,10 +292,11 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
     return answer;
   }
   const answer = await chatCompletion({
-    timeoutMs: cfg.upstreamTimeoutMs,
+    provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
+    timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.upstreamTimeoutMs,
     baseUrl: cfg.llmBaseUrl,
     apiKey: cfg.llmApiKey,
-    model: cfg.llmModel,
+    model: cfg.llmProvider === 'cursor' ? cfg.cursorModel : cfg.llmModel,
     systemPrompt: cfg.systemPrompt,
     history: [
       ...(conv.textFile ? [{ role: 'user' as const, content: `参考文件「${conv.textFile.filename}」：\n${conv.textFile.content}` }] : []),
@@ -295,6 +308,7 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
 }
 
 async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Promise<string | null> {
+  if (cfg.llmProvider === 'cursor') return '当前 Cursor 接入支持文字、文本文件和 SVG 绘图，暂不支持图片理解。';
   const mediaId = msg.image?.media_id;
   if (!mediaId) return null;
   const buf = await getMedia(cfg, mediaId);
@@ -302,6 +316,7 @@ async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Pro
   const mime = buf.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ? 'image/png' : 'image/jpeg';
   const dataUri = `data:${mime};base64,${buf.toString('base64')}`;
   const answer = await chatCompletion({
+    provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
     timeoutMs: cfg.upstreamTimeoutMs,
     baseUrl: cfg.llmBaseUrl,
     apiKey: cfg.llmApiKey,
@@ -327,6 +342,7 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
   const filename = msg.file?.file_name || '未命名文件';
   if (!mediaId) return null;
   const ext = extOf(filename);
+  if (cfg.llmProvider === 'cursor' && (OFFICE_EXT.has(ext) || DOC_EXT.has(ext))) return '当前 Cursor 接入暂不支持 PDF/Office，请发送 txt/md 等文本文件，或切回 API 模式。';
   if (OFFICE_EXT.has(ext)) return '目前请先把 Word/Excel/PPT 导出为 PDF，再发给我解读。';
   if (!TEXT_EXT.has(ext) && !DOC_EXT.has(ext)) return `这个格式（.${ext || '未知'}）暂不支持，请发送图片、PDF 或文本文件。`;
   const buf = await getMedia(cfg, mediaId);
@@ -337,10 +353,11 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
       content = `${content.slice(0, TEXT_FILE_CHAR_LIMIT)}\n（文件过长，已截断）`;
     }
     const answer = await chatCompletion({
-      timeoutMs: cfg.upstreamTimeoutMs,
+      provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
+      timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.upstreamTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
-      model: cfg.llmModel,
+      model: cfg.llmProvider === 'cursor' ? cfg.cursorModel : cfg.llmModel,
       systemPrompt: cfg.systemPrompt,
       history: [{
         role: 'user',
@@ -359,10 +376,10 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
     const up = await uploadFile({ signal, timeoutMs: cfg.upstreamTimeoutMs, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, buffer: buf, filename });
     await waitFileActive({ signal, timeoutMs: cfg.fileTaskTimeoutMs, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, fileId: up.id });
     const answer = await askFile({
-      timeoutMs: cfg.upstreamTimeoutMs,
+      timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.upstreamTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
-      model: cfg.llmModel,
+      model: cfg.llmProvider === 'cursor' ? cfg.cursorModel : cfg.llmModel,
       signal,
       fileId: up.id,
       question: '请用中文简要总结这个文件的要点。',
@@ -389,7 +406,7 @@ export async function createServer(cfg: Config) {
       if (prompt !== null) {
         if (!prompt) return { chunks: ['请描述想画的内容，例如：/draw 一只穿宇航服的猫'] };
         if (prompt.length > 4000) return { chunks: ['画图描述请控制在 4000 字以内。'] };
-        const picture = await generateImage({ baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.imageModel,
+        const picture = await generateImage({ provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.imageModel,
           prompt, timeoutMs: cfg.imageTimeoutMs });
         appendTurn(cfg, conv, `[画图] ${prompt}`, '[已生成一张图片]');
         return { session: serializeStore(store), chunks: [picture] };
@@ -506,6 +523,7 @@ export async function main(): Promise<void> {
   const cfg = loadConfig();
   const server = await createServer(cfg);
   const shutdown = () => {
+    cancelCursorRequests();
     server.close();
     const deadline = setTimeout(() => process.exit(1), 15000);
     deadline.unref();

@@ -9,9 +9,15 @@ services:
     env_file: .env
     environment:
       PORT: "8788"
+      CURSOR_STATE_DIR: /home/node/.cursor-agent-state
+    volumes:
+      - cursor-state:/home/node/.cursor-agent-state
     stop_grace_period: 20s
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  cursor-state:

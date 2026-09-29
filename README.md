@@ -83,7 +83,7 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 
 ## 实现与验证边界
 
-真实 PostgreSQL 17 上的 41 项本地测试和类型检查通过；尚未完成真实企业微信/方舟/云服务器联调。媒体默认路径为 `/cgi-bin/media/get`，可通过 `WECOM_MEDIA_PATH` 调整，需在目标账号核验。Office 转换与语音为待办。
+真实 PostgreSQL 17 及模拟 Cursor CLI 的本地测试和类型检查通过；尚未完成真实企业微信/方舟/云服务器联调。媒体默认路径为 `/cgi-bin/media/get`，可通过 `WECOM_MEDIA_PATH` 调整，需在目标账号核验。Office 转换与语音为待办。
 
 方舟上传参数使用 `purpose=user_data`，文档输入限制依据 [Files API 官方说明](https://docs.volcengine.com/docs/ark/file-api?lang=zh)。PostgreSQL 事务通过单一连接执行，参见 [node-postgres 事务文档](https://node-postgres.com/features/transactions)。
 
@@ -104,3 +104,14 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 Docker 镜像包含中文字体。直接在 Linux 上运行时，需要自行安装中文字体（例如 Noto Sans CJK），否则文字可能显示为方框。升级涉及数据库 schema 1→2，请先备份 PostgreSQL；迁移保留已有文本任务，旧应用版本不能直接打开升级后的库。
 
 对于 95018，默认仅查询状态并诊断。若确认采用机器人接待，可显式设置 WECOM_AUTO_TAKEOVER=true：仅当发送失败后查询到 state=0 时尝试转到 state=1，再用原 msgid 重试一次；不强制转出人工、排队或已结束会话。该操作仍受微信实际账号权限及会话规则限制，不保证解决所有 95018。
+
+
+## Cursor Agent 作为文本模型
+
+`.env` 设置 `LLM_PROVIDER=cursor`、`CURSOR_MODEL=auto`，然后 `bash start.sh docker`。首次启动会显示 Cursor 官方登录链接，浏览器授权完成后才启动服务；后续启动复用 `cursor-state` 数据卷。镜像改为 Debian/glibc 并预装官方 CLI。
+
+Cursor 模式覆盖文字聊天、文本文件与 SVG 绘图，不使用模型 HTTP API Key；图片理解和 PDF 暂保留在 API 模式。`LLM_PROVIDER=api` 保持原有功能和配置要求。两种模式使用同一个 PostgreSQL 会话库，切换前已有 PDF 目标需要 /reset 或切回 API 继续使用。
+
+子进程使用独立工作区与工具拒绝规则，输入通过 stdin 传入，不拼接 shell 命令；有超时、输出上限及关闭时取消。Cursor 登录凭证单独持久化，不写入镜像或 Git。具体操作见 [START.md](START.md)。
+
+Cursor 相关测试使用模拟 CLI 验证登录门控、上下文隔离、权限参数、超时和 SVG 兼容；真实 CLI 已验证可在容器中启动并识别未登录状态。实际账号授权和真实模型回复仍需你在部署服务器上完成验收。

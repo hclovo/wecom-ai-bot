@@ -1,3 +1,4 @@
+import { cursorCompletion } from './cursor-agent.ts';
 import { requestJson } from './http-client.ts';
 // 调用 OpenAI 兼容的 chat completions 接口（火山方舟 /api/v3 即此协议）
 
@@ -25,9 +26,14 @@ export interface ChatOptions {
   systemPrompt: string;
   history: ChatMessage[];
   timeoutMs?: number;
+  provider?: 'api' | 'cursor';
+  cursorBin?: string;
+  cursorStateDir?: string;
 }
 
-export async function chatCompletion({ baseUrl, apiKey, model, systemPrompt, history, timeoutMs }: ChatOptions): Promise<string> {
+export async function chatCompletion(options: ChatOptions): Promise<string> {
+  if (options.provider === 'cursor') return cursorCompletion(options);
+  const { baseUrl, apiKey, model, systemPrompt, history, timeoutMs } = options;
   const messages = [{ role: 'system', content: systemPrompt }, ...history];
   const data = await requestJson<{ choices?: Array<{ message?: { content?: unknown } }> }>(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
     method: 'POST',

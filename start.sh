@@ -32,6 +32,7 @@ if [ "$MODE" = docker ]; then
   docker compose version >/dev/null
   docker compose build
   docker compose run --rm --no-deps wecom-ai-bot node scripts/check-config.ts
+  docker compose run --rm --no-deps wecom-ai-bot node scripts/cursor-login.ts
   docker compose up -d
   printf '%s\n' '应用已后台启动。查看日志: docker compose logs --tail=100 -f wecom-ai-bot' \
     '查看健康状态: curl http://127.0.0.1:8788/healthz' \
@@ -48,5 +49,6 @@ if ! npm ls --omit=dev --depth=0 >/dev/null 2>&1; then
 fi
 node scripts/check-config.ts
 if [ "$MODE" = check ]; then exit 0; fi
+node scripts/cursor-login.ts
 printf '%s\n' '正在启动机器人，按 Ctrl+C 停止。'
 exec node server.ts

@@ -134,7 +134,7 @@ sudo chown wecomb:wecomb /opt/wecom-ai-bot/.env
 
 ### 5.1 Docker Compose（推荐）
 
-项目自带 `Dockerfile`（node:24-alpine 基础镜像、非 root 运行、自带 /healthz 探活）和 `compose.yaml`（`restart: unless-stopped`，随 Docker 服务开机自启）。配置从同目录 `.env` 注入，**不会打进镜像**。
+项目自带 `Dockerfile`（node:24-bookworm-slim 基础镜像、非 root 运行、自带 /healthz 探活）和 `compose.yaml`（`restart: unless-stopped`，随 Docker 服务开机自启）。配置从同目录 `.env` 注入，**不会打进镜像**。
 
 安装 Docker（如尚未安装）：
 
@@ -447,3 +447,14 @@ npm run typecheck
 当前覆盖真实 PostgreSQL 的事务回滚、并发额度、幂等提交、重启续发、实例锁与版本保护，微信/方舟仍使用 mock。云端联调与真实模型计费验证仍需另外执行。
 
 参考：[node-postgres 事务](https://node-postgres.com/features/transactions)、[PostgreSQL advisory lock](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS)。
+
+
+## 12. Cursor 登录模式部署
+
+在 .env 设置 LLM_PROVIDER=cursor 和 CURSOR_MODEL=auto，然后使用 `bash start.sh docker`。必须经过启动脚本的交互登录步骤，首次部署不要直接 `docker compose up` 跳过认证。脚本调用官方 CLI 打印登录 URL，由你在浏览器完成登录，确认成功后才后台启动应用。
+
+镜像基于 Debian/glibc，内置 CLI、SVG 渲染依赖和中文字体；构建需要能访问 Debian、npm 和 Cursor 官方下载源。Cursor 运行也需要访问官方服务。登录凭证保存在命名卷 cursor-state；容器更新不删除该卷。数据库仍连接你独立部署的 PostgreSQL。
+
+systemd 模式需先以运行服务的同一系统用户执行启动脚本完成登录，再启动 unit；CURSOR_STATE_DIR 建议配置为该用户可写的绝对路径。不要把 root 登录状态与 wecomb 服务用户混用。API 模式无需 Cursor 登录。
+
+该接入默认只读问答并禁用工具，支持文字/文本文件/SVG。图片和 PDF 继续使用 API 模式。CLI 升级可能改变参数或 JSON 格式，部署后先验证一条文字和 /draw；本次真实账号授权尚待服务器验收。

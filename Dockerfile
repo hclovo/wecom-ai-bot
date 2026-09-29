@@ -1,10 +1,16 @@
-# Node 原生 TypeScript + PostgreSQL 驱动，不需要编译
-FROM node:24-alpine
-RUN apk add --no-cache fontconfig font-noto-cjk
+# Debian/glibc is required by Cursor CLI. Also includes fonts for SVG rendering.
+FROM node:24-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl bash git fontconfig fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 USER node
+RUN curl -fsS https://cursor.com/install -o /tmp/install-cursor.sh \
+    && bash /tmp/install-cursor.sh && rm /tmp/install-cursor.sh \
+    && mkdir -p /home/node/.cursor-agent-state && chmod 700 /home/node/.cursor-agent-state
+ENV PATH="/home/node/.local/bin:${PATH}"
 COPY --chown=node:node server.ts ./
 COPY --chown=node:node lib ./lib/
 COPY --chown=node:node scripts ./scripts/
