@@ -1,5 +1,5 @@
 import { cancelCursorRequests } from './lib/cursor-agent.ts';
-import { drawingPrompt, generateImage } from './lib/image-generation.ts';
+import { drawingPrompt, generateImage, generateNativeImage } from './lib/image-generation.ts';
 import http from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -13,11 +13,18 @@ import type { KfMessage } from './lib/wecom-api.ts';
 import { uploadFile, waitFileActive, askFile } from './lib/ark-files.ts';
 import { chatCompletion } from './lib/llm.ts';
 import type { HistoryMessage } from './lib/llm.ts';
+import { conversationReply } from './lib/conversation-reply.ts';
+import type { ReplyChunk } from './lib/reply-types.ts';
 
 // ---------- 配置 ----------
 
 export interface Config extends DatabaseConfig {
   llmProvider: 'api' | 'cursor';
+  svgProvider: 'api' | 'cursor';
+  cursorFallback: boolean;
+  imageProvider: 'svg' | 'cursor';
+  cursorImageModel: string;
+  nativeImageTimeoutMs: number;
   cursorBin: string;
   cursorStateDir: string;
   cursorModel: string;
@@ -65,8 +72,18 @@ export function loadEnvFile(file: string): void {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const provider = env.LLM_PROVIDER || 'api';
   if (!['api','cursor'].includes(provider)) throw new Error('LLM_PROVIDER 必须为 api 或 cursor');
+  const svgProvider = env.SVG_PROVIDER || provider;
+  if (!['api','cursor'].includes(svgProvider)) throw new Error('SVG_PROVIDER 必须为 api 或 cursor');
+  if (env.CURSOR_FALLBACK && !['true','false'].includes(env.CURSOR_FALLBACK)) throw new Error('CURSOR_FALLBACK 必须为 true 或 false');
+  const imageProvider = env.IMAGE_PROVIDER || 'svg';
+  if (!['svg', 'cursor'].includes(imageProvider)) throw new Error('IMAGE_PROVIDER 必须为 svg 或 cursor');
   const cfg = {
     llmProvider: provider,
+    svgProvider,
+    cursorFallback: env.CURSOR_FALLBACK === 'true',
+    imageProvider,
+    cursorImageModel: env.CURSOR_IMAGE_MODEL || env.CURSOR_MODEL || 'auto',
+    nativeImageTimeoutMs: Number(env.IMAGE_TIMEOUT_MS || 180000),
     cursorBin: env.CURSOR_AGENT_BIN || 'cursor-agent',
     cursorStateDir: env.CURSOR_STATE_DIR || './.cursor-agent-state',
     cursorModel: env.CURSOR_MODEL || 'auto',
@@ -82,7 +99,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     llmBaseUrl: env.LLM_BASE_URL || '',
     llmApiKey: env.LLM_API_KEY || '',
     llmModel: env.LLM_MODEL || '',
-    imageModel: env.SVG_MODEL || (provider === 'cursor' ? (env.CURSOR_MODEL || 'auto') : env.LLM_MODEL),
+    imageModel: env.SVG_MODEL || (svgProvider === 'cursor' ? (env.CURSOR_MODEL || 'auto') : env.LLM_MODEL),
     imageTimeoutMs: Number(env.SVG_TIMEOUT_MS || 120000),
     llmVisionModel: env.LLM_VISION_MODEL || env.LLM_MODEL, // 看图模型，需支持视觉
     systemPrompt: env.LLM_SYSTEM_PROMPT || '你是一位用户的好朋友，通过微信聊天。回复要口语化、简洁自然，一般不超过 150 字，不用 markdown 格式，分点列表。',
@@ -107,11 +124,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     WECOM_KF_SECRET: cfg.kfSecret,
     WECOM_TOKEN: cfg.token,
     WECOM_ENCODING_AES_KEY: cfg.aesKey,
-    ...(provider === 'api' ? { LLM_BASE_URL: cfg.llmBaseUrl, LLM_API_KEY: cfg.llmApiKey, LLM_MODEL: cfg.llmModel } : {}),
+    ...(provider === 'api' || (imageProvider === 'svg' && svgProvider === 'api') ? { LLM_BASE_URL: cfg.llmBaseUrl, LLM_API_KEY: cfg.llmApiKey, LLM_MODEL: cfg.llmModel } : {}),
   }).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length > 0) throw new Error(`缺少配置: ${missing.join(', ')}（参考 .env.example）`);
   for (const key of ['port', 'maxTurns', 'fileMaxMb', 'upstreamTimeoutMs', 'fileTaskTimeoutMs',
-    'imageTimeoutMs', 'cursorTimeoutMs', 'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
+    'imageTimeoutMs', 'nativeImageTimeoutMs', 'cursorTimeoutMs', 'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
     if (!Number.isSafeInteger(cfg[key]) || cfg[key] < 1) throw new Error(`配置 ${key} 必须为正整数`);
   }
   if (cfg.port > 65535) throw new Error('PORT 超出范围');
@@ -216,7 +233,7 @@ function handleCommand(store: UserStore, conv: Conversation, content: string): s
 
   switch (cmd.toLowerCase()) {
     case '/help':
-      return '可用指令：\n/new [标题] 开新会话\n/list 列出会话\n/switch 编号 切换会话\n/del 编号 删除会话\n/reset 清空当前会话上下文\n/draw 描述 生成 SVG 插画或图表（也可发：画图：描述）';
+      return '可用指令：\n/new [标题] 开新会话\n/list 列出会话\n/switch 编号 切换会话\n/del 编号 删除会话\n/reset 清空当前会话上下文\n/draw 描述 生成图片（也可在聊天中直接要求配图）';
 
     case '/new': {
       const id = store.nextId++;
@@ -272,7 +289,18 @@ function handleCommand(store: UserStore, conv: Conversation, content: string): s
   return `未知指令「${cmd}」，发 /help 查看可用指令。`;
 }
 
-async function handleText(cfg: Config, store: UserStore, conv: Conversation, content: string): Promise<string> {
+function cursorFallback(cfg: Config) {
+  return cfg.cursorFallback ? { model: cfg.cursorModel, timeoutMs: cfg.cursorTimeoutMs } : undefined;
+}
+
+function drawImage(cfg: Config, prompt: string) {
+  if (cfg.imageProvider === 'cursor') return generateNativeImage({ cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
+    model: cfg.cursorImageModel, prompt, timeoutMs: cfg.nativeImageTimeoutMs });
+  return generateImage({ provider: cfg.svgProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
+    baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.imageModel, prompt, timeoutMs: cfg.imageTimeoutMs });
+}
+
+async function handleText(cfg: Config, store: UserStore, conv: Conversation, content: string): Promise<string | ReplyChunk[]> {
   if (content.startsWith('/')) return handleCommand(store, conv, content);
   // 首条消息给默认命名的会话起标题
   if (conv.title === '闲聊' && conv.history.length === 0) conv.title = content.slice(0, 12);
@@ -291,8 +319,9 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
     appendTurn(cfg, conv, `[文件 ${filename}] 问：${content}`, answer);
     return answer;
   }
-  const answer = await chatCompletion({
+  const answer = await conversationReply({
     provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
+    fallbackCursor: cursorFallback(cfg),
     timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.upstreamTimeoutMs,
     baseUrl: cfg.llmBaseUrl,
     apiKey: cfg.llmApiKey,
@@ -302,13 +331,13 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
       ...(conv.textFile ? [{ role: 'user' as const, content: `参考文件「${conv.textFile.filename}」：\n${conv.textFile.content}` }] : []),
       ...conv.history, { role: 'user', content },
     ],
-  });
-  appendTurn(cfg, conv, content, answer);
-  return answer;
+  }, prompt => drawImage(cfg, prompt), cfg.imageProvider === 'cursor' ? 'native' : 'svg');
+  appendTurn(cfg, conv, content, answer.historyText);
+  return answer.chunks;
 }
 
 async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Promise<string | null> {
-  if (cfg.llmProvider === 'cursor') return '当前 Cursor 接入支持文字、文本文件和 SVG 绘图，暂不支持图片理解。';
+  if (cfg.llmProvider === 'cursor') return '当前 Cursor 对话接入暂不支持图片理解，请使用 API 对话模式。';
   const mediaId = msg.image?.media_id;
   if (!mediaId) return null;
   const buf = await getMedia(cfg, mediaId);
@@ -354,6 +383,7 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
     }
     const answer = await chatCompletion({
       provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
+      fallbackCursor: cursorFallback(cfg),
       timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.upstreamTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
@@ -400,14 +430,13 @@ export async function createServer(cfg: Config) {
   const worker = await MessageWorker.create(cfg, async (msg, saved) => {
     const store = getUserStore(saved);
     const conv = getActive(store);
-    let reply: string | null = null;
+    let reply: string | ReplyChunk[] | null = null;
     try {
       const prompt = msg.msgtype === 'text' ? drawingPrompt(msg.text?.content || '') : null;
       if (prompt !== null) {
         if (!prompt) return { chunks: ['请描述想画的内容，例如：/draw 一只穿宇航服的猫'] };
         if (prompt.length > 4000) return { chunks: ['画图描述请控制在 4000 字以内。'] };
-        const picture = await generateImage({ provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.imageModel,
-          prompt, timeoutMs: cfg.imageTimeoutMs });
+        const picture = await drawImage(cfg, prompt);
         appendTurn(cfg, conv, `[画图] ${prompt}`, '[已生成一张图片]');
         return { session: serializeStore(store), chunks: [picture] };
       }
@@ -418,11 +447,14 @@ export async function createServer(cfg: Config) {
         case 'voice': reply = '语音消息我还听不了，打字发我吧～'; break;
         case 'video': reply = '视频处理还没上线，先发文字、图片或文档吧'; break;
       }
-      return { session: serializeStore(store), chunks: reply ? splitReply(reply) : [] };
+      const chunks = reply === null ? [] : typeof reply === 'string' ? [reply] : reply;
+      return { session: serializeStore(store), chunks: chunks.flatMap<ReplyChunk>(chunk => typeof chunk === 'string' ? splitReply(chunk) : [chunk]) };
     } catch (error) {
       if (msg.msgtype === 'text' && drawingPrompt(msg.text?.content || '') !== null) {
         console.error('[draw]', errorCode(error));
-        return { chunks: ['SVG 绘图失败，请简化描述后再试。可以画流程图、信息图、图标或简洁插画；暂不支持照片级效果。'] };
+        return { chunks: [cfg.imageProvider === 'cursor'
+          ? 'Cursor 生图失败，请稍后重试；需要确认 Cursor 已登录且支持原生生图。'
+          : 'SVG 绘图失败，请简化描述后再试。可以画流程图、信息图、图标或简洁插画；暂不支持照片级效果。'] };
       }
       console.error('[model]', errorCode(error));
       // Discard partial mutations on failure. Persist an error reply for delivery retries.

@@ -281,6 +281,59 @@ test('draw command uses text model, sends a real image, retries without regenera
   }finally{await bot.stopWorker();}
 });
 
+test('ordinary API conversation uses Cursor drawing and sends text then image without regenerating on retry', async t => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'wecom-mixed-'));
+  const bin = join(dir, 'agent');
+  const sharp = (await import('sharp')).default;
+  const png = await sharp({ create: { width: 64, height: 64, channels: 3, background: 'blue' } }).png().toBuffer();
+  await writeFile(bin, `#!/usr/bin/env node
+const args=process.argv.slice(2);
+if(args[args.indexOf('--model')+1]!=='draw-model')process.exit(2);
+if(args.includes('--mode'))process.exit(4);
+let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>{
+if(!input.includes('付款流程图'))process.exit(3);
+require('node:fs').writeFileSync('generated.png',Buffer.from('${png.toString('base64')}','base64'));
+console.log(JSON.stringify({type:'result',result:'完成'}));
+});
+`, { mode: 0o700 });
+  clearTokenCache();
+  let models = 0, uploads = 0, imageSends = 0;
+  const sent: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    const path = new URL(String(url)).pathname;
+    if (path.endsWith('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    if (path.endsWith('/chat/completions')) {
+      models++;
+      const body = JSON.parse(String(init?.body));
+      assert.equal(body.model, cfg.llmModel);
+      assert.equal(body.messages.at(-1).content, '解释付款流程，配张图');
+      return Response.json({ choices: [{ message: { content: '{"text":"先下单，再付款。","image_prompt":"付款流程图：下单、付款、完成"}' } }] });
+    }
+    if (path.endsWith('/media/upload')) { uploads++; return Response.json({ media_id: 'mixed-image' }); }
+    assert.ok(path.endsWith('/send_msg'));
+    const body = JSON.parse(String(init?.body));
+    sent.push(body.msgtype);
+    if (body.msgtype === 'image' && ++imageSends === 1) return new Response('', { status: 503 });
+    if (body.msgtype === 'text') assert.equal(body.text.content, '先下单，再付款。');
+    return Response.json({ errcode: 0 });
+  });
+  const bot = await createServer({ ...cfg, ...testDatabase(), imageProvider: 'cursor', cursorBin: bin,
+    cursorStateDir: join(dir, 'state'), cursorImageModel: 'draw-model', nativeImageTimeoutMs: 5000 });
+  try {
+    await add(bot.worker.store, [msg('mixed', 'user', '解释付款流程，配张图')]);
+    bot.worker.start();
+    await until(async () => await bot.worker.store.pendingCount() === 0, 10000);
+    assert.deepEqual(sent, ['text', 'image', 'image']);
+    assert.equal(models, 1); assert.equal(uploads, 1);
+    const session = await bot.worker.store.session(JSON.stringify(['kf', 'user']));
+    assert.match(session!, /已生成配图/);
+    assert.ok(!session!.includes('image_prompt'));
+  } finally { await bot.stopWorker(); await rm(dir, { recursive: true, force: true }); }
+});
+
 test('saved generated image survives restart and refreshes expired media without a model call',async(t)=>{
   const dbConfig=testDatabase();const store=await MessageStore.open(dbConfig);
   const {renderSvg}=await import('../lib/image-generation.ts');

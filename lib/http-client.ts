@@ -54,7 +54,7 @@ export async function requestJson<T>(url: string, init: RequestInit = {}, option
 
 // Log only structured status codes, never untrusted error text / response content.
 export function errorCode(error: unknown): string {
-  if (error instanceof Error && ['CURSOR_NOT_INSTALLED','CURSOR_TIMEOUT','CURSOR_OUTPUT_INVALID','CURSOR_PROCESS_FAILED'].includes(error.name)) return error.name;
+  if (error instanceof Error && ['CURSOR_NOT_INSTALLED','CURSOR_TIMEOUT','CURSOR_OUTPUT_INVALID','CURSOR_PROCESS_FAILED','CURSOR_IMAGE_MISSING'].includes(error.name)) return error.name;
   if (error instanceof HttpError) return `HTTP_${error.status}`;
   if (error && typeof error === 'object' && 'errcode' in error) return `WECOM_${Number(error.errcode)}`;
   if (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name)) return error.name;

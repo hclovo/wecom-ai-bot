@@ -1,5 +1,5 @@
 import { cursorCompletion } from './cursor-agent.ts';
-import { requestJson } from './http-client.ts';
+import { requestJson, errorCode } from './http-client.ts';
 // 调用 OpenAI 兼容的 chat completions 接口（火山方舟 /api/v3 即此协议）
 
 export type ChatContentPart =
@@ -29,10 +29,20 @@ export interface ChatOptions {
   provider?: 'api' | 'cursor';
   cursorBin?: string;
   cursorStateDir?: string;
+  fallbackCursor?: { model: string; timeoutMs: number };
 }
 
 export async function chatCompletion(options: ChatOptions): Promise<string> {
   if (options.provider === 'cursor') return cursorCompletion(options);
+  try { return await apiCompletion(options); }
+  catch (error) {
+    if (!options.fallbackCursor || options.history.some(m => typeof m.content !== 'string')) throw error;
+    console.error('[llm-fallback]', errorCode(error), 'cursor');
+    return cursorCompletion({ ...options, ...options.fallbackCursor });
+  }
+}
+
+async function apiCompletion(options: ChatOptions): Promise<string> {
   const { baseUrl, apiKey, model, systemPrompt, history, timeoutMs } = options;
   const messages = [{ role: 'system', content: systemPrompt }, ...history];
   const data = await requestJson<{ choices?: Array<{ message?: { content?: unknown } }> }>(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {

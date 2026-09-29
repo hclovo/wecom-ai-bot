@@ -2,8 +2,21 @@ import sharp from 'sharp';
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { chatCompletion } from './llm.ts';
 import type { ImageReply } from './reply-types.ts';
+import { cursorGenerateImage } from './cursor-agent.ts';
+import type { CursorOptions } from './cursor-agent.ts';
 
 export const WECHAT_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+
+export async function generateNativeImage(options: CursorOptions & { prompt: string }): Promise<ImageReply> {
+  const bytes = await cursorGenerateImage(options);
+  const input = sharp(bytes, { limitInputPixels: 40_000_000 });
+  const metadata = await input.metadata();
+  if (!['png', 'jpeg', 'webp'].includes(metadata.format || '')) throw new Error('Cursor 未返回有效位图');
+  const image = await input.rotate().resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
+    .flatten({ background: '#ffffff' }).jpeg({ quality: 85 }).timeout({ seconds: 10 }).toBuffer();
+  if (image.length > WECHAT_IMAGE_MAX_BYTES) throw new Error('图片超过微信大小上限');
+  return { kind: 'image', base64: image.toString('base64') };
+}
 const MAX_SVG_BYTES = 200 * 1024;
 
 export function drawingPrompt(text: string): string | null {

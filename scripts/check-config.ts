@@ -4,7 +4,7 @@ loadEnvFile(new URL('../.env', import.meta.url).pathname);
 try {
   const cfg = loadConfig();
   const placeholders = ['yourCallbackToken', 'your-ark-api-key', 'ep-2024xxxxxxxxxxxxxxxx'];
-  const names = ['WECOM_CORP_ID', 'WECOM_KF_SECRET', 'WECOM_TOKEN', 'WECOM_ENCODING_AES_KEY', ...(cfg.llmProvider === 'api' ? ['LLM_API_KEY', 'LLM_MODEL'] : [])];
+  const names = ['WECOM_CORP_ID', 'WECOM_KF_SECRET', 'WECOM_TOKEN', 'WECOM_ENCODING_AES_KEY', ...(cfg.llmProvider === 'api' || (cfg.imageProvider === 'svg' && cfg.svgProvider === 'api') ? ['LLM_API_KEY', 'LLM_MODEL'] : [])];
   const unfinished = names.filter((name) => {
     const value = process.env[name] || '';
     return placeholders.includes(value) || /x{6,}/.test(value);

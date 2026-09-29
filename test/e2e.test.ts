@@ -263,7 +263,8 @@ test('端到端：文本对话（验证回调 → 拉消息 → LLM → 回复 �
     const llmReq = calls.chat[0];
     assert.equal(llmReq.model, CFG.llmModel);
     assert.equal(llmReq.messages[0].role, 'system');
-    assert.equal(llmReq.messages[0].content, CFG.systemPrompt);
+    assert.ok(llmReq.messages[0].content.startsWith(CFG.systemPrompt));
+    assert.match(llmReq.messages[0].content, /image_prompt/);
     assert.deepEqual(llmReq.messages[llmReq.messages.length - 1], { role: 'user', content: '在吗？帮我写首关于秋天的短诗' });
 
     await waitFor(() => calls.sendMsg.length >= 1, 5000, 'send_msg 发出');

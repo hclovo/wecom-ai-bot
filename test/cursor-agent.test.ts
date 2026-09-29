@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, mkdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { cursorAuthenticated, cursorCompletion, ensureCursorLogin } from '../lib/cursor-agent.ts';
+import { cursorAuthenticated, cursorCompletion, ensureCursorLogin, cursorGenerateImage } from '../lib/cursor-agent.ts';
 import { chatCompletion } from '../lib/llm.ts';
-import { generateImage } from '../lib/image-generation.ts';
+import { generateImage, generateNativeImage } from '../lib/image-generation.ts';
+import sharp from 'sharp';
 import { loadConfig } from '../server.ts';
 
 async function fixture() {
@@ -89,4 +90,65 @@ test('Cursor configuration does not require model API credentials',()=>{
   const cfg=loadConfig({LLM_PROVIDER:'cursor',DATABASE_URL:'postgresql://test:test@localhost/test',WECOM_CORP_ID:'corp',WECOM_KF_SECRET:'secret',WECOM_TOKEN:'token',
     WECOM_ENCODING_AES_KEY:Buffer.alloc(32,1).toString('base64').slice(0,43)});
   assert.equal(cfg.llmProvider,'cursor');assert.equal(cfg.cursorModel,'auto');assert.equal(cfg.imageModel,'auto');assert.equal(cfg.llmApiKey,'');
+});
+
+test('API chat falls back once to Cursor with its own model and full text context', async t => {
+  const f = await fixture();
+  let calls = 0;
+  const options = { ...f, provider: 'api' as const, baseUrl: 'https://model.test', apiKey: 'test', model: 'api-model',
+    systemPrompt: 'test', history: [{ role: 'user' as const, content: '保留上下文' }], fallbackCursor: { model: 'auto', timeoutMs: 5000 } };
+  try {
+    t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('', { status: 503 }); });
+    const result = JSON.parse(await chatCompletion(options));
+    assert.equal(result.conversation[0].content, '保留上下文');
+    assert.equal(calls, 1);
+    await assert.rejects(chatCompletion({ ...options, fallbackCursor: undefined }));
+    await assert.rejects(chatCompletion({ ...options, history: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,AA==' } }] }] }));
+    await assert.rejects(chatCompletion({ ...options, fallbackCursor: { model: 'fail', timeoutMs: 5000 } }), /CURSOR_PROCESS_FAILED/);
+    t.mock.restoreAll();
+    t.mock.method(globalThis, 'fetch', async () => Response.json({ choices: [{ message: { content: 'API成功' } }] }));
+    assert.equal(await chatCompletion({ ...options, cursorBin: '/missing-cursor' }), 'API成功');
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('drawing provider and fallback are independent of the main API provider', () => {
+  const env = { LLM_PROVIDER: 'api', SVG_PROVIDER: 'cursor', CURSOR_FALLBACK: 'true', CURSOR_MODEL: 'cursor-model',
+    LLM_MODEL: 'api-model', LLM_BASE_URL: 'https://model.test', LLM_API_KEY: 'test', DATABASE_URL: 'postgresql://test:test@localhost/test',
+    WECOM_CORP_ID: 'corp', WECOM_KF_SECRET: 'secret', WECOM_TOKEN: 'token', WECOM_ENCODING_AES_KEY: Buffer.alloc(32, 1).toString('base64').slice(0, 43) };
+  const cfg = loadConfig(env);
+  assert.equal(cfg.llmProvider, 'api'); assert.equal(cfg.svgProvider, 'cursor');
+  assert.equal(cfg.imageModel, 'cursor-model'); assert.equal(cfg.cursorFallback, true);
+  assert.throws(() => loadConfig({ ...env, SVG_PROVIDER: 'bad' }), /SVG_PROVIDER/);
+  assert.throws(() => loadConfig({ ...env, CURSOR_FALLBACK: 'bad' }), /CURSOR_FALLBACK/);
+  assert.equal(loadConfig({ ...env, IMAGE_PROVIDER: 'cursor', CURSOR_IMAGE_MODEL: 'native-model' }).cursorImageModel, 'native-model');
+  assert.throws(() => loadConfig({ ...env, IMAGE_PROVIDER: 'bad' }), /IMAGE_PROVIDER/);
+});
+
+test('native Cursor image generation uses GenerateImage permission, reads raster output and rejects missing or symlink output', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'wecom-native-test-'));
+  const bin = join(dir, 'agent');
+  const png = await sharp({ create: { width: 64, height: 48, channels: 3, background: '#0088ff' } }).png().toBuffer();
+  await writeFile(bin, `#!/usr/bin/env node
+const fs=require('node:fs'),path=require('node:path'),args=process.argv.slice(2);
+if(args.includes('--mode')||args.includes('--force'))process.exit(2);
+const p=JSON.parse(fs.readFileSync('.cursor/cli.json','utf8')).permissions;
+if(!p.allow.includes('GenerateImage(*)')||!p.deny.includes('Shell(*)')||!p.deny.includes('Write(**)'))process.exit(3);
+if(process.env.LLM_API_KEY||process.env.DATABASE_URL)process.exit(4);
+let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>{
+if(!input.includes('GenerateImage')||!input.includes('file_path'))process.exit(5);
+const model=args[args.indexOf('--model')+1];
+if(model==='native')fs.writeFileSync('generated.png',Buffer.from('${png.toString('base64')}','base64'));
+if(model==='svg')fs.writeFileSync('generated.png','<svg><rect width="10" height="10"/></svg>');
+if(model==='link')fs.symlinkSync(${JSON.stringify(bin)},'generated.png');
+console.log(JSON.stringify({type:'result',result:'完成 /etc/passwd'}));
+});
+`, { mode: 0o700 });
+  const options = { cursorBin: bin, cursorStateDir: join(dir, 'state'), model: 'native', timeoutMs: 5000, prompt: '一只猫' };
+  try {
+    assert.deepEqual(await cursorGenerateImage(options), png);
+    const image = await generateNativeImage(options);
+    assert.equal((await sharp(Buffer.from(image.base64, 'base64')).metadata()).format, 'jpeg');
+    for (const model of ['missing', 'link']) await assert.rejects(cursorGenerateImage({ ...options, model }), /CURSOR_IMAGE_MISSING/);
+    await assert.rejects(generateNativeImage({ ...options, model: 'svg' }));
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

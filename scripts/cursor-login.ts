@@ -1,7 +1,7 @@
 import { loadEnvFile } from '../server.ts';
 import { ensureCursorLogin } from '../lib/cursor-agent.ts';
 loadEnvFile(new URL('../.env', import.meta.url).pathname);
-if (process.env.LLM_PROVIDER === 'cursor') {
+if (process.env.LLM_PROVIDER === 'cursor' || process.env.SVG_PROVIDER === 'cursor' || process.env.IMAGE_PROVIDER === 'cursor' || process.env.CURSOR_FALLBACK === 'true') {
   try {
     await ensureCursorLogin({ cursorBin:process.env.CURSOR_AGENT_BIN, cursorStateDir:process.env.CURSOR_STATE_DIR });
   } catch (error) {

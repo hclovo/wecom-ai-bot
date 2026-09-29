@@ -72,6 +72,8 @@ docker compose stop wecom-ai-bot
 
 ## 使用 SVG 绘图
 
+以下是兼容旧配置的 SVG 通道。需要 Cursor 自带生图能力，请使用文末的混合模式配置。
+
 更新代码后重新执行 `./start.sh docker`（本机运行用 `./start.sh`）。在微信里发送：
 
 ```text
@@ -114,3 +116,22 @@ bash start.sh docker
 登录过期后重新执行 `bash start.sh docker`，或单独运行 `docker compose run --rm --no-deps wecom-ai-bot node scripts/cursor-login.ts` 完成授权。模型可用性和额度以你的 Cursor 账号为准；账号登录不等于无限调用。
 
 官方依据：[登录与 NO_OPEN_BROWSER](https://prod.cursor.com/docs/cli/reference/authentication)、[命令参数](https://prod.cursor.com/docs/cli/reference/parameters)。
+
+## API 日常对话 + Cursor 原生生图 + Cursor 兜底
+
+保留真实 API 配置，修改 `.env`：
+
+```dotenv
+LLM_PROVIDER=api
+IMAGE_PROVIDER=cursor
+CURSOR_FALLBACK=true
+CURSOR_MODEL=auto
+CURSOR_IMAGE_MODEL=auto
+IMAGE_TIMEOUT_MS=180000
+```
+
+执行 `bash start.sh docker` 重建并启动，按需完成 Cursor 登录。普通聊天可直接说“解释一下这个流程，配一张图”，API 决定文字和配图内容，Cursor 使用内置 GenerateImage 生成图片；`/draw` 同样切到原生生图。API 文字调用失败才使用 Cursor 聊天兜底。不要把 API 接入点 ID 填入 CURSOR_MODEL 或 CURSOR_IMAGE_MODEL。
+
+未设置 IMAGE_PROVIDER 时仍使用原来的 SVG 方式。SVG_MODEL、SVG_PROVIDER、SVG_TIMEOUT_MS 只控制 SVG 方式，不影响原生生图。原生生图失败会明确提示，不偷偷改成 SVG。图片理解/PDF 问答仍由 API 处理；文件附件发送尚未实现。
+
+验收：发送普通文字、要求配图的文字和 `/draw` 各一条，确认微信收到真正的图片；在测试环境模拟 API 失败确认 Cursor 兜底。日志 `[llm-fallback]` 表示触发兜底，`[conversation-draw]`/`[draw]` 表示生图失败，`CURSOR_IMAGE_MISSING` 表示 CLI 没有在约定位置输出图片，需核对账号能力、CLI 版本与工具权限。

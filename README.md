@@ -39,7 +39,7 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 | `/del 编号` | 删除会话，至少保留一个 |
 | `/reset` | 清空当前历史与文件目标 |
 | `/help` | 显示指令 |
-| `/draw 描述` | 文本模型生成 SVG，渲染后发送图片 |
+| `/draw 描述` | 按 IMAGE_PROVIDER 生成图片；普通聊天也可要求配图 |
 
 会话 #1 是初始默认会话，也可以删除或淘汰。首条文字为默认会话命名。每个客服账号、好友的状态独立，默认保留最近 12 个完整轮次，同时有历史字符预算。
 
@@ -95,6 +95,8 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 
 ## SVG 绘图
 
+本节适用于 `IMAGE_PROVIDER=svg`（兼容旧配置的默认值）。使用 Cursor 原生生图见下一节。
+
 直接发送 `/draw 一只穿宇航服的猫`、`画图：订单处理流程图` 或 `帮我画一张生日贺卡`。使用现有文本模型生成 SVG，经白名单校验后渲染为 1024×1024 JPEG 并发回微信。适合流程图、信息图、图标、简洁插画；不适合写实照片，也不支持基于上传图片的编辑。
 
 默认复用 LLM_MODEL/LLM_BASE_URL/LLM_API_KEY；可设置 SVG_MODEL（同一接口下的文本模型）和 SVG_TIMEOUT_MS。**不需要图片生成模型、图片 API Key 或对象存储**。仍会产生文本模型调用费用，/draw 纳入每日请求限额。
@@ -115,3 +117,24 @@ Cursor 模式覆盖文字聊天、文本文件与 SVG 绘图，不使用模型 H
 子进程使用独立工作区与工具拒绝规则，输入通过 stdin 传入，不拼接 shell 命令；有超时、输出上限及关闭时取消。Cursor 登录凭证单独持久化，不写入镜像或 Git。具体操作见 [START.md](START.md)。
 
 Cursor 相关测试使用模拟 CLI 验证登录门控、上下文隔离、权限参数、超时和 SVG 兼容；真实 CLI 已验证可在容器中启动并识别未登录状态。实际账号授权和真实模型回复仍需你在部署服务器上完成验收。
+
+## API 主聊、Cursor 原生生图和兜底
+
+在 `.env` 中设置以下配置，并保留有效的 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`：
+
+```dotenv
+LLM_PROVIDER=api
+IMAGE_PROVIDER=cursor
+CURSOR_FALLBACK=true
+CURSOR_MODEL=auto
+CURSOR_IMAGE_MODEL=auto
+IMAGE_TIMEOUT_MS=180000
+```
+
+普通聊天由 API 回复，通过结构化回复决定是否配图，例如“解释付款流程，配张图”或接着说“把刚才的过程画出来”。需要配图时，Cursor 在独立临时工作区调用内置 GenerateImage 工具，机器人读取实际生成的位图、转换为微信大小限制内的 JPEG，按文字、图片顺序发送。`/draw` 也使用此通道。原生生图不经过 SVG；只有 `IMAGE_PROVIDER=svg` 才使用旧通道，旧通道的模型可通过 `SVG_PROVIDER=api|cursor` 和 `SVG_MODEL` 独立指定。
+
+API 文字调用失败时，开启的 `CURSOR_FALLBACK` 会将同一文字上下文交给 Cursor，使用 CURSOR_MODEL 和 CURSOR_TIMEOUT_MS，最多兜底一次。API 正常时不调用 Cursor 聊天；图片输入及 PDF Files/Responses 链路不兜底到仅支持文本的 Cursor 接入。配图生成失败保留文字并提示失败；微信发送重试复用已保存的图片，不重新生图。每条入站消息计一次请求配额，模型调用可能包含对话、绘图和兜底等多次调用。
+
+运行 `bash start.sh docker` 会在启用任何 Cursor 通道时检查登录。原生生图需要支持 GenerateImage 的较新 Cursor CLI 和账号权限；代码核验基于 CLI 2026.09.18-9a7762b，使用项目权限 `GenerateImage(*)`，不启用 `--force`、Shell 或任意文件读写。模型返回的路径、URL 不作为下载目标，只读取临时目录中约定的生成文件。模拟 CLI 和数据库测试覆盖路由、图文发送、失败重试及文件校验；真实账号生图和微信收图仍需部署验收。
+
+参考：[Cursor 原生生图说明](https://cursor.com/changelog/page/12)、[CLI 更新日志](https://cursor.com/docs/cli/changelog)。当前接入仍不包含文件附件发送、网络图片检索或上传图片编辑。
