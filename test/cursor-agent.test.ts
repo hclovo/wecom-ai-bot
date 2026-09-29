@@ -135,7 +135,7 @@ const p=JSON.parse(fs.readFileSync('.cursor/cli.json','utf8')).permissions;
 if(!p.allow.includes('GenerateImage(*)')||!p.deny.includes('Shell(*)')||!p.deny.includes('Write(**)'))process.exit(3);
 if(process.env.LLM_API_KEY||process.env.DATABASE_URL)process.exit(4);
 let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>{
-if(!input.includes('GenerateImage')||args[args.indexOf('--output-format')+1]!=='stream-json')process.exit(5);
+if(input!=='生成图片：一只猫'||args[args.indexOf('--output-format')+1]!=='stream-json')process.exit(5);
 const model=args[args.indexOf('--model')+1];
 if(model==='native')fs.writeFileSync('generated.png',Buffer.from('${png.toString('base64')}','base64'));
 if(model==='svg')fs.writeFileSync('generated.png','<svg><rect width="10" height="10"/></svg>');
@@ -204,4 +204,8 @@ test('image diagnostics distinguish event shapes and expose only metadata in nor
   assert.equal(imageRunDiagnostic(JSON.stringify({type:'result',result:'需要权限批准'})).responseHint, 'permission');
   assert.equal(imageRunDiagnostic(JSON.stringify({type:'result',result:'Insufficient credits'})).responseHint, 'quota_or_billing');
   assert.deepEqual(imageRunDiagnostic(JSON.stringify({type:'result',result:'完成'})).tools, []);
+  const discovery = imageRunDiagnostic(JSON.stringify({type:'tool_call',subtype:'completed',tool_call:{
+    getMcpToolsToolCall:{args:{pattern:'GenerateImage'},result:{success:{content:'No matching tools. https://secret.test/?token=abc'}}},
+  }}));
+  assert.deepEqual(discovery.toolDiscovery, [{query:'GenerateImage',status:'success',response:'No matching tools. [URL]'}]);
 });
