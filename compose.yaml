@@ -1,6 +1,10 @@
 services:
   wecom-ai-bot:
-    build: .
+    build:
+      context: .
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-http://deb.debian.org/debian-security}
     image: wecom-ai-bot:latest
     container_name: wecom-ai-bot
     restart: unless-stopped
