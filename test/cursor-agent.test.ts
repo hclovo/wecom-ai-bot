@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, mkdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { cursorAuthenticated, cursorCompletion, ensureCursorLogin, cursorGenerateImage } from '../lib/cursor-agent.ts';
+import { cursorAuthenticated, cursorCompletion, ensureCursorLogin, cursorGenerateImage, readGeneratedImage } from '../lib/cursor-agent.ts';
 import { chatCompletion } from '../lib/llm.ts';
 import { generateImage, generateNativeImage } from '../lib/image-generation.ts';
 import sharp from 'sharp';
@@ -135,13 +135,15 @@ const p=JSON.parse(fs.readFileSync('.cursor/cli.json','utf8')).permissions;
 if(!p.allow.includes('GenerateImage(*)')||!p.deny.includes('Shell(*)')||!p.deny.includes('Write(**)'))process.exit(3);
 if(process.env.LLM_API_KEY||process.env.DATABASE_URL)process.exit(4);
 let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>{
-if(!input.includes('GenerateImage')||!input.includes('file_path'))process.exit(5);
+if(!input.includes('GenerateImage')||args[args.indexOf('--output-format')+1]!=='stream-json')process.exit(5);
 const model=args[args.indexOf('--model')+1];
 if(model==='native')fs.writeFileSync('generated.png',Buffer.from('${png.toString('base64')}','base64'));
 if(model==='svg')fs.writeFileSync('generated.png','<svg><rect width="10" height="10"/></svg>');
 if(model==='link')fs.symlinkSync(${JSON.stringify(bin)},'generated.png');
-console.log(JSON.stringify({type:'result',result:'完成 /etc/passwd'}));
+console.log(JSON.stringify({type:'tool_call',subtype:'completed',tool_call:{generateImageToolCall:{result:{success:{filePath:'generated.png'}}}}}));
+console.log(JSON.stringify({type:'result',subtype:'success',result:'完成 /etc/passwd'}));
 });
+
 `, { mode: 0o700 });
   const options = { cursorBin: bin, cursorStateDir: join(dir, 'state'), model: 'native', timeoutMs: 5000, prompt: '一只猫' };
   try {
@@ -150,5 +152,33 @@ console.log(JSON.stringify({type:'result',result:'完成 /etc/passwd'}));
     assert.equal((await sharp(Buffer.from(image.base64, 'base64')).metadata()).format, 'jpeg');
     for (const model of ['missing', 'link']) await assert.rejects(cursorGenerateImage({ ...options, model }), /CURSOR_IMAGE_MISSING/);
     await assert.rejects(generateNativeImage({ ...options, model: 'svg' }));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('native image tool stream handles inline data, actual artifact paths and explicit failure states', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'wecom-artifact-test-'));
+  const final = { type: 'result', subtype: 'success', result: '完成。/etc/passwd' };
+  const completed = (result: unknown) => ({ type: 'tool_call', subtype: 'completed', tool_call: { generateImageToolCall: { result } } });
+  const stream = (...events: unknown[]) => [...events, final].map(e => JSON.stringify(e)).join('\n');
+  try {
+    const bytes = Buffer.from('binary image bytes');
+    const success = { filePath: '/different/artifact/path.png', imageData: bytes.toString('base64') };
+    assert.deepEqual(await readGeneratedImage(stream(completed({ success })), dir), bytes);
+    assert.deepEqual(await readGeneratedImage(stream({ type: 'tool_call', subtype: 'completed', tool_call: {
+      tool: { case: 'generateImageToolCall', value: { result: { result: { case: 'success', value: success } } } },
+    } }), dir), bytes);
+    await mkdir(join(dir, 'assets'));
+    await writeFile(join(dir, 'assets', 'actual.webp'), bytes);
+    assert.deepEqual(await readGeneratedImage(stream(completed({ success: { filePath: 'assets/actual.webp' } })), dir), bytes);
+    await assert.rejects(readGeneratedImage(stream(), dir), /CURSOR_IMAGE_NOT_CALLED/);
+    await assert.rejects(readGeneratedImage(stream(completed({ error: { error: 'private provider error' } })), dir), /CURSOR_IMAGE_TOOL_FAILED/);
+    for (const filePath of ['/etc/passwd', '../secret.png', 'https://example.com/image.png']) {
+      await assert.rejects(readGeneratedImage(stream(completed({ success: { filePath } })), dir), /CURSOR_IMAGE_MISSING/);
+    }
+    const { symlink } = await import('node:fs/promises');
+    await symlink('/etc', join(dir, 'outside'));
+    await assert.rejects(readGeneratedImage(stream(completed({ success: { filePath: 'outside/passwd' } })), dir), /CURSOR_IMAGE_MISSING/);
+    await assert.rejects(readGeneratedImage(stream(completed({ success: { imageData: '%%%' } })), dir), /CURSOR_OUTPUT_INVALID/);
+    await assert.rejects(readGeneratedImage(JSON.stringify(completed({ success })), dir), /CURSOR_OUTPUT_INVALID/);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

@@ -295,7 +295,7 @@ if(args[args.indexOf('--model')+1]!=='draw-model')process.exit(2);
 if(args.includes('--mode'))process.exit(4);
 let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>{
 if(!input.includes('付款流程图'))process.exit(3);
-require('node:fs').writeFileSync('generated.png',Buffer.from('${png.toString('base64')}','base64'));
+console.log(JSON.stringify({type:'tool_call',subtype:'completed',tool_call:{generateImageToolCall:{result:{success:{filePath:'assets/actual-output.png',imageData:'${png.toString('base64')}'}}}}}));
 console.log(JSON.stringify({type:'result',result:'完成'}));
 });
 `, { mode: 0o700 });

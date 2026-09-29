@@ -134,4 +134,4 @@ IMAGE_TIMEOUT_MS=180000
 
 未设置 IMAGE_PROVIDER 时仍使用原来的 SVG 方式。SVG_MODEL、SVG_PROVIDER、SVG_TIMEOUT_MS 只控制 SVG 方式，不影响原生生图。原生生图失败会明确提示，不偷偷改成 SVG。图片理解/PDF 问答仍由 API 处理；文件附件发送尚未实现。
 
-验收：发送普通文字、要求配图的文字和 `/draw` 各一条，确认微信收到真正的图片；在测试环境模拟 API 失败确认 Cursor 兜底。日志 `[llm-fallback]` 表示触发兜底，`[conversation-draw]`/`[draw]` 表示生图失败，`CURSOR_IMAGE_MISSING` 表示 CLI 没有在约定位置输出图片，需核对账号能力、CLI 版本与工具权限。
+验收：发送普通文字、要求配图的文字和 `/draw` 各一条，确认微信收到真正的图片；在测试环境模拟 API 失败确认 Cursor 兜底。日志 `[llm-fallback]` 表示触发兜底，`[conversation-draw]`/`[draw]` 表示生图失败，`CURSOR_IMAGE_NOT_CALLED` 表示没有观测到原生生图工具调用；`CURSOR_IMAGE_TOOL_FAILED` 表示工具没有返回成功结果；`CURSOR_IMAGE_MISSING` 表示工具报告成功，但没有有效的内嵌图片数据或本次临时目录中可读取的实际图片文件。新版本从工具事件取回图片，不依赖固定的 generated.png 文件名。

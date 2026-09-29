@@ -135,6 +135,6 @@ IMAGE_TIMEOUT_MS=180000
 
 API 文字调用失败时，开启的 `CURSOR_FALLBACK` 会将同一文字上下文交给 Cursor，使用 CURSOR_MODEL 和 CURSOR_TIMEOUT_MS，最多兜底一次。API 正常时不调用 Cursor 聊天；图片输入及 PDF Files/Responses 链路不兜底到仅支持文本的 Cursor 接入。配图生成失败保留文字并提示失败；微信发送重试复用已保存的图片，不重新生图。每条入站消息计一次请求配额，模型调用可能包含对话、绘图和兜底等多次调用。
 
-运行 `bash start.sh docker` 会在启用任何 Cursor 通道时检查登录。原生生图需要支持 GenerateImage 的较新 Cursor CLI 和账号权限；代码核验基于 CLI 2026.09.18-9a7762b，使用项目权限 `GenerateImage(*)`，不启用 `--force`、Shell 或任意文件读写。模型返回的路径、URL 不作为下载目标，只读取临时目录中约定的生成文件。模拟 CLI 和数据库测试覆盖路由、图文发送、失败重试及文件校验；真实账号生图和微信收图仍需部署验收。
+运行 `bash start.sh docker` 会在启用任何 Cursor 通道时检查登录。原生生图需要支持 GenerateImage 的较新 Cursor CLI 和账号权限；代码核验基于 CLI 2026.09.18-9a7762b，使用项目权限 `GenerateImage(*)`，不启用 `--force`、Shell 或任意文件读写。通过 stream-json 检查 GenerateImage 工具成功事件，优先取回 imageData；没有内嵌数据时，只读取工具返回的本次临时工作区内实际文件路径，并校验真实路径和文件类型。不读取最终回复文字里的路径，不下载模型返回的 URL。模拟 CLI 和数据库测试覆盖路由、图文发送、失败重试及文件校验；真实账号生图和微信收图仍需部署验收。
 
 参考：[Cursor 原生生图说明](https://cursor.com/changelog/page/12)、[CLI 更新日志](https://cursor.com/docs/cli/changelog)。当前接入仍不包含文件附件发送、网络图片检索或上传图片编辑。
