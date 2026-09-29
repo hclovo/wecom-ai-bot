@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, mkdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { cursorAuthenticated, cursorCompletion, ensureCursorLogin, cursorGenerateImage, readGeneratedImage } from '../lib/cursor-agent.ts';
+import { cursorAuthenticated, cursorCompletion, ensureCursorLogin, cursorGenerateImage, readGeneratedImage, imageRunDiagnostic } from '../lib/cursor-agent.ts';
 import { chatCompletion } from '../lib/llm.ts';
 import { generateImage, generateNativeImage } from '../lib/image-generation.ts';
 import sharp from 'sharp';
@@ -181,4 +181,27 @@ test('native image tool stream handles inline data, actual artifact paths and ex
     await assert.rejects(readGeneratedImage(stream(completed({ success: { imageData: '%%%' } })), dir), /CURSOR_OUTPUT_INVALID/);
     await assert.rejects(readGeneratedImage(JSON.stringify(completed({ success })), dir), /CURSOR_OUTPUT_INVALID/);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+
+test('image diagnostics distinguish event shapes and expose only metadata in normal logs', () => {
+  const raw = [
+    { type: 'system', subtype: 'init', api_key: 'PRIVATE' },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'GenerateImage is unavailable' }] } },
+    { type: 'tool_call', tool_call: { otherToolCall: { args: { text: 'PRIVATE_PROMPT' } } } },
+    { type: 'result', is_error: false, result: 'No access to GenerateImage. https://secret.test/?token=abc user@example.com Bearer abc123' },
+  ].map(e => JSON.stringify(e)).join('\n');
+  const diagnostic = imageRunDiagnostic(raw);
+  assert.equal(diagnostic.responseHint, 'tool_unavailable');
+  assert.deepEqual(diagnostic.tools, ['otherToolCall']);
+  assert.equal(diagnostic.events.tool_call, 1);
+  assert.ok(!JSON.stringify(diagnostic).includes('PRIVATE'));
+  assert.ok(!diagnostic.finalReply.includes('abc123'));
+  assert.ok(!diagnostic.finalReply.includes('user@example.com'));
+  assert.ok(!diagnostic.finalReply.includes('secret.test'));
+  const { finalReply, ...metadata } = diagnostic;
+  assert.ok(!JSON.stringify(metadata).includes('GenerateImage is unavailable'));
+  assert.equal(imageRunDiagnostic(JSON.stringify({type:'result',result:'需要权限批准'})).responseHint, 'permission');
+  assert.equal(imageRunDiagnostic(JSON.stringify({type:'result',result:'Insufficient credits'})).responseHint, 'quota_or_billing');
+  assert.deepEqual(imageRunDiagnostic(JSON.stringify({type:'result',result:'完成'})).tools, []);
 });
