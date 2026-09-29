@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, mkdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { cursorAuthenticated, cursorCompletion, ensureCursorLogin, cursorGenerateImage, readGeneratedImage, imageRunDiagnostic } from '../lib/cursor-agent.ts';
+import { cursorAuthenticated, cursorCompletion, ensureCursorLogin, cursorGenerateImage, readGeneratedImage, imageRunDiagnostic, cursorEnvironment } from '../lib/cursor-agent.ts';
 import { chatCompletion } from '../lib/llm.ts';
 import { generateImage, generateNativeImage } from '../lib/image-generation.ts';
 import sharp from 'sharp';
@@ -132,26 +132,42 @@ test('native Cursor image generation uses GenerateImage permission, reads raster
 const fs=require('node:fs'),path=require('node:path'),args=process.argv.slice(2);
 if(args.includes('--mode')||args.includes('--force'))process.exit(2);
 const p=JSON.parse(fs.readFileSync('.cursor/cli.json','utf8')).permissions;
-if(!p.allow.includes('GenerateImage(*)')||!p.deny.includes('Shell(*)')||!p.deny.includes('Write(**)'))process.exit(3);
+const globalConfig=JSON.parse(fs.readFileSync(path.join(process.env.CURSOR_CONFIG_DIR,'cli-config.json'),'utf8'));
+for(const policy of [p,globalConfig.permissions]) {
+if(!policy.allow.includes('GenerateImage(*)')||!policy.allow.some(x=>x.startsWith('Write(')&&x.includes('/assets/')))process.exit(3);
+if(policy.deny.includes('Write(**)')||policy.deny.includes('Write(/**)')||!policy.deny.includes('Shell(*)'))process.exit(6);
+}
+const writable=target=>p.allow.filter(x=>x.startsWith('Write(')).some(x=>path.matchesGlob(target,x.slice(6,-1)));
+if(!writable(path.resolve('assets/generated.png'))||!writable(path.resolve('data/projects/project/assets/generated.png')))process.exit(8);
+if(writable('/etc/passwd')||writable(path.resolve('config/cli-config.json')))process.exit(9);
+if(globalConfig.authInfo?.testMarker!=='preserved')process.exit(7);
 if(process.env.LLM_API_KEY||process.env.DATABASE_URL)process.exit(4);
 let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>{
-if(input!=='生成图片：一只猫'||args[args.indexOf('--output-format')+1]!=='stream-json')process.exit(5);
+if(input!=='生成图片：一只猫\\n保存到 assets/ 目录。'||args[args.indexOf('--output-format')+1]!=='stream-json')process.exit(5);
 const model=args[args.indexOf('--model')+1];
-if(model==='native')fs.writeFileSync('generated.png',Buffer.from('${png.toString('base64')}','base64'));
-if(model==='svg')fs.writeFileSync('generated.png','<svg><rect width="10" height="10"/></svg>');
-if(model==='link')fs.symlinkSync(${JSON.stringify(bin)},'generated.png');
-console.log(JSON.stringify({type:'tool_call',subtype:'completed',tool_call:{generateImageToolCall:{result:{success:{filePath:'generated.png'}}}}}));
+if(model==='native')fs.writeFileSync('assets/generated.png',Buffer.from('${png.toString('base64')}','base64'));
+if(model==='svg')fs.writeFileSync('assets/generated.png','<svg><rect width="10" height="10"/></svg>');
+if(model==='link')fs.symlinkSync(${JSON.stringify(bin)},'assets/generated.png');
+console.log(JSON.stringify({type:'tool_call',subtype:'completed',tool_call:{generateImageToolCall:{result:{success:{filePath:'assets/generated.png'}}}}}));
 console.log(JSON.stringify({type:'result',subtype:'success',result:'完成 /etc/passwd'}));
 });
 
 `, { mode: 0o700 });
   const options = { cursorBin: bin, cursorStateDir: join(dir, 'state'), model: 'native', timeoutMs: 5000, prompt: '一只猫' };
+  const env = await cursorEnvironment(options);
+  const configPath = join(env.CURSOR_CONFIG_DIR!, 'cli-config.json');
+  const saved = JSON.parse(await readFile(configPath, 'utf8'));
+  saved.authInfo = { testMarker: 'preserved' };
+  await writeFile(configPath, JSON.stringify(saved));
   try {
     assert.deepEqual(await cursorGenerateImage(options), png);
     const image = await generateNativeImage(options);
     assert.equal((await sharp(Buffer.from(image.base64, 'base64')).metadata()).format, 'jpeg');
     for (const model of ['missing', 'link']) await assert.rejects(cursorGenerateImage({ ...options, model }), /CURSOR_IMAGE_MISSING/);
     await assert.rejects(generateNativeImage({ ...options, model: 'svg' }));
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), saved);
+    assert.ok(saved.permissions.deny.includes('Write(**)'));
+    assert.ok(saved.permissions.deny.includes('Write(/**)'));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

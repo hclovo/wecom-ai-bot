@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, rm, open, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, open, realpath } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -14,19 +14,33 @@ export class CursorAgentError extends Error {
   constructor(code: 'CURSOR_NOT_INSTALLED' | 'CURSOR_TIMEOUT' | 'CURSOR_OUTPUT_INVALID' | 'CURSOR_PROCESS_FAILED' | 'CURSOR_IMAGE_MISSING' | 'CURSOR_IMAGE_NOT_CALLED' | 'CURSOR_IMAGE_TOOL_FAILED' | 'CURSOR_IMAGE_RESULT_UNRECOGNIZED') { super(code); this.name = code; }
 }
 
-// Native GenerateImage has its own permission, independent of text-file writes.
-// Never enable --force or shell access merely to obtain an image.
+// GenerateImage also checks file-write permissions when saving its output.
+// Give this invocation its own config; leave the shared chat/login config intact.
 export async function cursorGenerateImage(options: CursorOptions & { prompt: string; onDiagnostic?: (diagnostic: ImageRunDiagnostic) => void }): Promise<Buffer> {
   const env = await cursorEnvironment(options);
-  const workspace = await mkdtemp(join(tmpdir(), 'wecom-cursor-image-'));
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), 'wecom-cursor-image-')));
   env.CURSOR_DATA_DIR = join(workspace, 'data');
   try {
+    const config = join(workspace, 'config');
+    const saved = JSON.parse(await readFile(join(env.CURSOR_CONFIG_DIR!, 'cli-config.json'), 'utf8'));
+    const permissions = {
+      allow: ['GenerateImage(*)', `Write(${workspace}/**/assets/**)`, `Write(${workspace}/assets/**)`],
+      deny: [...new Set<string>([...DENY, ...(saved.permissions?.deny || [])])]
+        .filter(rule => rule !== 'Write(**)' && rule !== 'Write(/**)'),
+    };
+    permissions.deny.push('Write(.cursor/**)', `Write(${workspace}/.cursor/**)`, `Write(${config}/**)`);
+    await mkdir(config, { mode: 0o700 });
+    // Preserve login metadata; file-backed credentials keep using the same XDG path.
+    await writeFile(join(config, 'cli-config.json'), JSON.stringify({ ...saved, permissions }), { mode: 0o600 });
+    await writeFile(join(config, 'mcp.json'), '{"mcpServers":{}}', { mode: 0o600 });
+    env.CURSOR_CONFIG_DIR = config;
     await mkdir(join(workspace, '.cursor'), { mode: 0o700 });
-    await writeFile(join(workspace, '.cursor', 'cli.json'), JSON.stringify({ permissions: { allow: ['GenerateImage(*)'], deny: DENY } }), { mode: 0o600 });
+    await mkdir(join(workspace, 'assets'), { mode: 0o700 });
+    await writeFile(join(workspace, '.cursor', 'cli.json'), JSON.stringify({ permissions }), { mode: 0o600 });
     await writeFile(join(workspace, '.cursor', 'mcp.json'), '{"mcpServers":{}}', { mode: 0o600 });
     const output = await runCaptured(options.cursorBin || 'cursor-agent', [
       '--print', '--output-format', 'stream-json', '--trust', '--workspace', workspace, '--model', options.model || 'auto',
-    ], env, workspace, `生成图片：${options.prompt}`, options.timeoutMs ?? 180000, 48 * 1024 * 1024);
+    ], env, workspace, `生成图片：${options.prompt}\n保存到 assets/ 目录。`, options.timeoutMs ?? 180000, 48 * 1024 * 1024);
     const diagnostic = imageRunDiagnostic(output);
     options.onDiagnostic?.(diagnostic);
     try { return await readGeneratedImage(output, workspace); }
