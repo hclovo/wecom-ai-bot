@@ -305,7 +305,7 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
   // 首条消息给默认命名的会话起标题
   if (conv.title === '闲聊' && conv.history.length === 0) conv.title = content.slice(0, 12);
   if (conv.pendingFile) {
-    if (cfg.llmProvider === 'cursor') return '当前 Cursor 模式暂不支持之前的 PDF 追问。请发 /reset 开始文字对话，或切回 API 模式。';
+    if (cfg.llmProvider === 'cursor') return '暂时无法继续处理这个文件，请发送 /reset 开始新对话。';
     const { fileId, filename } = conv.pendingFile;
     const answer = await askFile({
       timeoutMs: cfg.upstreamTimeoutMs,
@@ -337,7 +337,7 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
 }
 
 async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Promise<string | null> {
-  if (cfg.llmProvider === 'cursor') return '当前 Cursor 对话接入暂不支持图片理解，请使用 API 对话模式。';
+  if (cfg.llmProvider === 'cursor') return '暂时无法识别图片，请用文字描述。';
   const mediaId = msg.image?.media_id;
   if (!mediaId) return null;
   const buf = await getMedia(cfg, mediaId);
@@ -371,7 +371,7 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
   const filename = msg.file?.file_name || '未命名文件';
   if (!mediaId) return null;
   const ext = extOf(filename);
-  if (cfg.llmProvider === 'cursor' && (OFFICE_EXT.has(ext) || DOC_EXT.has(ext))) return '当前 Cursor 接入暂不支持 PDF/Office，请发送 txt/md 等文本文件，或切回 API 模式。';
+  if (cfg.llmProvider === 'cursor' && (OFFICE_EXT.has(ext) || DOC_EXT.has(ext))) return '暂不支持此类文档，请发送 txt 或 md 文本文件。';
   if (OFFICE_EXT.has(ext)) return '目前请先把 Word/Excel/PPT 导出为 PDF，再发给我解读。';
   if (!TEXT_EXT.has(ext) && !DOC_EXT.has(ext)) return `这个格式（.${ext || '未知'}）暂不支持，请发送图片、PDF 或文本文件。`;
   const buf = await getMedia(cfg, mediaId);
@@ -452,13 +452,11 @@ export async function createServer(cfg: Config) {
     } catch (error) {
       if (msg.msgtype === 'text' && drawingPrompt(msg.text?.content || '') !== null) {
         console.error('[draw]', errorCode(error));
-        return { chunks: [cfg.imageProvider === 'cursor'
-          ? 'Cursor 生图失败，请稍后重试；需要确认 Cursor 已登录且支持原生生图。'
-          : 'SVG 绘图失败，请简化描述后再试。可以画流程图、信息图、图标或简洁插画；暂不支持照片级效果。'] };
+        return { chunks: ['图片生成失败，请稍后重试。'] };
       }
       console.error('[model]', errorCode(error));
       // Discard partial mutations on failure. Persist an error reply for delivery retries.
-      return { chunks: ['处理时出了点小问题，请稍后重试；如果正在追问文件，也可以重新发送文件。'] };
+      return { chunks: ['处理失败，请稍后重试。'] };
     }
   });
   let stopping: Promise<void> | undefined;

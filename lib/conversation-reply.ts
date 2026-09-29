@@ -33,7 +33,7 @@ export async function conversationReply(options: ChatOptions, draw: (prompt: str
       historyText += `\n[已生成配图：${reply.imagePrompt}]`;
     } catch (error) {
       console.error('[conversation-draw]', errorCode(error));
-      const notice = '这次配图生成失败了，可以稍后让我重画。';
+      const notice = '配图生成失败，请稍后重试。';
       chunks.push(notice);
       historyText += `\n${notice}`;
     }
