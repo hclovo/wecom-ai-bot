@@ -150,6 +150,15 @@ cd /opt/wecom-ai-bot        # 第 4 步的 .env 已就位于此
 sudo docker compose up -d --build
 ```
 
+如果构建长时间停在 `apt-get` 下载（尤其是中文字体包），可以切换 Debian 主仓库镜像：
+
+```bash
+sudo docker compose build --build-arg DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
+sudo docker compose up -d --no-build
+```
+
+默认保留 Debian 官方源；安全更新源可单独通过 `DEBIAN_SECURITY_MIRROR` 构建参数设置。基础镜像首次安装 CA 证书前使用 HTTP，apt 仍会校验仓库签名。apt 索引、软件包和 npm 下载均使用 BuildKit 本地缓存，同一 builder 后续构建可复用；换机器或清理缓存后需要重新下载。下载缓存不包含在最终镜像中。连接超时设为 30 秒并重试 3 次，这不是整个构建的总时限。首次部署仍需按下文完成 Cursor 登录。
+
 常用运维命令：
 
 ```bash
