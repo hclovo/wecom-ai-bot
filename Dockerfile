@@ -1,5 +1,6 @@
 # Node 原生 TypeScript + PostgreSQL 驱动，不需要编译
 FROM node:24-alpine
+RUN apk add --no-cache fontconfig font-noto-cjk
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force

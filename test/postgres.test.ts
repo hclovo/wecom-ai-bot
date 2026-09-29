@@ -94,8 +94,19 @@ test('newer migration version rejects startup without resetting jobs', async () 
   const cfg=testDatabase();const store=await MessageStore.open(cfg);const sql=admin(cfg);
   await seed(store,['one']);const job=(await store.nextJobs(1))[0];await store.start(job);await store.close();
   try {
-    await sql.query('INSERT INTO schema_migrations VALUES(2)');
+    await sql.query('INSERT INTO schema_migrations VALUES(3)');
     await assert.rejects(MessageStore.open(cfg),/版本/);
     assert.equal((await sql.query('SELECT status FROM inbox')).rows[0].status,'processing');
   } finally {await sql.end();}
+});
+
+test('version 1 outbox migrates to version 2 without losing pending text replies',async()=>{
+  const cfg=testDatabase();let store=await MessageStore.open(cfg);const sql=admin(cfg);
+  try{
+    await seed(store,['legacy']);const job=(await store.nextJobs(1))[0];await store.saveReply(job,'legacy-session',['old text']);await store.close();
+    await sql.query('ALTER TABLE outbox DROP COLUMN kind, DROP COLUMN media_id, DROP COLUMN media_expires_at; DELETE FROM schema_migrations WHERE version=2;');
+    store=await MessageStore.open(cfg);const parts=await store.parts(job);
+    assert.equal(parts[0].kind,'text');assert.equal(parts[0].content,'old text');assert.equal(await store.session(job.user_key),'legacy-session');
+    assert.equal((await sql.query('SELECT max(version) AS version FROM schema_migrations')).rows[0].version,2);
+  }finally{await store.close();await sql.end();}
 });

@@ -1,3 +1,4 @@
+import { drawingPrompt, generateImage } from './lib/image-generation.ts';
 import http from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -26,6 +27,8 @@ export interface Config extends DatabaseConfig {
   llmBaseUrl: string;
   llmApiKey: string;
   llmModel: string;
+  imageModel: string;
+  imageTimeoutMs: number;
   llmVisionModel: string; // 看图模型，需支持视觉
   systemPrompt: string;
   maxTurns: number;
@@ -40,6 +43,7 @@ export interface Config extends DatabaseConfig {
   maxSendAttempts: number;
   retentionDays: number;
   mediaPath: string;
+  autoTakeover: boolean;
 }
 
 export function loadEnvFile(file: string): void {
@@ -65,6 +69,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     llmBaseUrl: env.LLM_BASE_URL,
     llmApiKey: env.LLM_API_KEY,
     llmModel: env.LLM_MODEL,
+    imageModel: env.SVG_MODEL || env.LLM_MODEL,
+    imageTimeoutMs: Number(env.SVG_TIMEOUT_MS || 120000),
     llmVisionModel: env.LLM_VISION_MODEL || env.LLM_MODEL, // 看图模型，需支持视觉
     systemPrompt: env.LLM_SYSTEM_PROMPT || '你是一位用户的好朋友，通过微信聊天。回复要口语化、简洁自然，一般不超过 150 字，不用 markdown 格式，分点列表。',
     maxTurns: Number(env.MAX_HISTORY_TURNS || 12),
@@ -80,6 +86,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxSendAttempts: Number(env.MAX_SEND_ATTEMPTS || 5),
     retentionDays: Number(env.RETENTION_DAYS || 30),
     mediaPath: env.WECOM_MEDIA_PATH || '/cgi-bin/media/get',
+    autoTakeover: env.WECOM_AUTO_TAKEOVER === 'true',
 
   };
   const missing = Object.entries({
@@ -93,12 +100,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length > 0) throw new Error(`缺少配置: ${missing.join(', ')}（参考 .env.example）`);
   for (const key of ['port', 'maxTurns', 'fileMaxMb', 'upstreamTimeoutMs', 'fileTaskTimeoutMs',
-    'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
+    'imageTimeoutMs', 'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
     if (!Number.isSafeInteger(cfg[key]) || cfg[key] < 1) throw new Error(`配置 ${key} 必须为正整数`);
   }
   if (cfg.port > 65535) throw new Error('PORT 超出范围');
   if (!/^\/[a-zA-Z0-9/_-]+$/.test(cfg.mediaPath)) throw new Error('WECOM_MEDIA_PATH 必须是 API 路径');
   if (!/^[A-Za-z0-9+/]{43}$/.test(cfg.aesKey!)) throw new Error('EncodingAESKey 必须为 43 位 Base64 字符');
+  if (env.WECOM_AUTO_TAKEOVER && !['true', 'false'].includes(env.WECOM_AUTO_TAKEOVER)) throw new Error('WECOM_AUTO_TAKEOVER 必须为 true 或 false');
   // 走到这里缺失校验已保证必填字段非空
   return cfg as Config;
 }
@@ -197,7 +205,7 @@ function handleCommand(store: UserStore, conv: Conversation, content: string): s
 
   switch (cmd.toLowerCase()) {
     case '/help':
-      return '可用指令：\n/new [标题] 开新会话\n/list 列出会话\n/switch 编号 切换会话\n/del 编号 删除会话\n/reset 清空当前会话上下文';
+      return '可用指令：\n/new [标题] 开新会话\n/list 列出会话\n/switch 编号 切换会话\n/del 编号 删除会话\n/reset 清空当前会话上下文\n/draw 描述 生成 SVG 插画或图表（也可发：画图：描述）';
 
     case '/new': {
       const id = store.nextId++;
@@ -377,6 +385,15 @@ export async function createServer(cfg: Config) {
     const conv = getActive(store);
     let reply: string | null = null;
     try {
+      const prompt = msg.msgtype === 'text' ? drawingPrompt(msg.text?.content || '') : null;
+      if (prompt !== null) {
+        if (!prompt) return { chunks: ['请描述想画的内容，例如：/draw 一只穿宇航服的猫'] };
+        if (prompt.length > 4000) return { chunks: ['画图描述请控制在 4000 字以内。'] };
+        const picture = await generateImage({ baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.imageModel,
+          prompt, timeoutMs: cfg.imageTimeoutMs });
+        appendTurn(cfg, conv, `[画图] ${prompt}`, '[已生成一张图片]');
+        return { session: serializeStore(store), chunks: [picture] };
+      }
       switch (msg.msgtype) {
         case 'text': reply = await handleText(cfg, store, conv, (msg.text?.content || '').trim()); break;
         case 'image': reply = await handleImage(cfg, conv, msg); break;
@@ -386,6 +403,10 @@ export async function createServer(cfg: Config) {
       }
       return { session: serializeStore(store), chunks: reply ? splitReply(reply) : [] };
     } catch (error) {
+      if (msg.msgtype === 'text' && drawingPrompt(msg.text?.content || '') !== null) {
+        console.error('[draw]', errorCode(error));
+        return { chunks: ['SVG 绘图失败，请简化描述后再试。可以画流程图、信息图、图标或简洁插画；暂不支持照片级效果。'] };
+      }
       console.error('[model]', errorCode(error));
       // Discard partial mutations on failure. Persist an error reply for delivery retries.
       return { chunks: ['处理时出了点小问题，请稍后重试；如果正在追问文件，也可以重新发送文件。'] };

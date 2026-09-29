@@ -10,6 +10,7 @@ export interface WecomApiConfig {
   upstreamTimeoutMs?: number;
   fileMaxMb?: number;
   mediaPath?: string;
+  autoTakeover?: boolean;
 }
 
 const TOKEN_RENEW_MARGIN_MS = 5 * 60 * 1000;
@@ -133,18 +134,55 @@ export function getServiceState(cfg: WecomApiConfig, openKfId: string, externalU
   });
 }
 
-export function sendText(cfg: WecomApiConfig, { touser, openKfId, msgid, content }: SendTextOptions): Promise<WecomResponse> {
+async function sendMessage(cfg: WecomApiConfig, body: Record<string, unknown>): Promise<WecomResponse> {
   return withToken(cfg, async (accessToken) => {
-    const data: WecomResponse = await httpJson(cfg, `${cfg.apiBase}/cgi-bin/kf/send_msg?access_token=${accessToken}`, {
-      touser,
-      open_kfid: openKfId,
-      msgid,
-      msgtype: 'text',
-      text: { content },
-    });
+    const data: WecomResponse = await httpJson(cfg, `${cfg.apiBase}/cgi-bin/kf/send_msg?access_token=${accessToken}`, body);
     if (data.errcode !== 0) throw new WecomApiError('send_msg', data);
     return data;
   });
+}
+
+async function recoverAndSend(cfg: WecomApiConfig, body: Record<string, unknown>): Promise<WecomResponse> {
+  try { return await sendMessage(cfg, body); }
+  catch (error) {
+    if (!(error instanceof WecomApiError) || error.errcode !== 95018) throw error;
+    const state = await getServiceState(cfg, String(body.open_kfid), String(body.touser));
+    // Only an unassigned session can be claimed. Never change human/queued/closed sessions.
+    console.error('[send-state]', `service_state=${state}`);
+    if (state !== 0 || !cfg.autoTakeover) throw error;
+    await withToken(cfg, async (accessToken) => {
+      const data = await httpJson(cfg, `${cfg.apiBase}/cgi-bin/kf/service_state/trans?access_token=${accessToken}`, {
+        open_kfid: body.open_kfid, external_userid: body.touser, service_state: 1,
+      });
+      if (data.errcode !== 0) throw new WecomApiError('service_state/trans', data);
+    });
+    // Preserve msgid, retry once. A second 95018 is terminal and gets diagnosed by worker.
+    return sendMessage(cfg, body);
+  }
+}
+
+export function sendText(cfg: WecomApiConfig, { touser, openKfId, msgid, content }: SendTextOptions): Promise<WecomResponse> {
+  return recoverAndSend(cfg, { touser, open_kfid: openKfId, msgid, msgtype: 'text', text: { content } });
+}
+
+export async function uploadImage(cfg: WecomApiConfig, bytes: Buffer): Promise<string> {
+  if (!bytes.length || bytes.length > 2 * 1024 * 1024) throw new Error('微信图片必须在 2MB 以内');
+  return withToken(cfg, async (accessToken) => {
+    const form = new FormData();
+    form.append('media', new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' }), 'generated.jpg');
+    const data = await requestJson<{ errcode?: number; media_id?: string }>(
+      `${cfg.apiBase}/cgi-bin/media/upload?access_token=${accessToken}&type=image`, { method: 'POST', body: form },
+      { timeoutMs: cfg.upstreamTimeoutMs },
+    );
+    if (data.errcode !== undefined && data.errcode !== 0) throw new WecomApiError('media/upload', { errcode: data.errcode });
+    if (typeof data.media_id !== 'string' || !data.media_id) throw new Error('图片上传未返回 media_id');
+    return data.media_id;
+  });
+}
+
+export function sendImage(cfg: WecomApiConfig, options: { touser: string; openKfId: string; msgid: string; mediaId: string }): Promise<WecomResponse> {
+  return recoverAndSend(cfg, { touser: options.touser, open_kfid: options.openKfId, msgid: options.msgid,
+    msgtype: 'image', image: { media_id: options.mediaId } });
 }
 
 // Media route is configurable for API compatibility; validate against the target account.

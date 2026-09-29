@@ -250,3 +250,53 @@ test('Office files are rejected before download and PDF upload uses official pur
     assert.ok(calls.some(c=>c.endsWith('/responses')));
   } finally {await bot.stopWorker();}
 });
+
+test('draw command uses text model, sends a real image, retries without regeneration and consumes quota',async(t)=>{
+  clearTokenCache();let models=0,uploads=0,imageSends=0;const texts:string[]=[];
+  t.mock.method(globalThis,'fetch',async(url:string|URL|Request,init?:RequestInit)=>{
+    const path=new URL(String(url)).pathname;
+    if(path.endsWith('/gettoken'))return Response.json({errcode:0,access_token:'token',expires_in:7200});
+    if(path.endsWith('/chat/completions')){
+      models++;const request=JSON.parse(String(init?.body));assert.ok(request.messages[0].content.includes('SVG'));
+      return Response.json({choices:[{message:{content:'<svg><rect width="1024" height="1024" fill="#28a"/><text x="100" y="200">你好</text></svg>'}}]});
+    }
+    if(path.endsWith('/media/upload')){
+      uploads++;const media=(init!.body as FormData).get('media') as Blob;
+      assert.equal(media.type,'image/jpeg');assert.ok(media.size<2*1024*1024);
+      return Response.json({media_id:'generated'});
+    }
+    assert.ok(path.endsWith('/send_msg'));
+    const request=JSON.parse(String(init?.body));
+    if(request.msgtype==='image'){
+      imageSends++;assert.deepEqual(request.image,{media_id:'generated'});
+      if(imageSends===1)return new Response('',{status:503});
+    }else texts.push(request.text.content);
+    return Response.json({errcode:0});
+  });
+  const bot=await createServer({...cfg,...testDatabase(),dailyRequestLimit:1});
+  try{
+    await add(bot.worker.store,[msg('draw-1','user','/draw 猫'),msg('draw-2','user','画图：狗')]);bot.worker.start();
+    await until(async()=>await bot.worker.store.pendingCount()===0,5000);
+    assert.equal(models,1);assert.equal(uploads,1);assert.equal(imageSends,2);assert.ok(texts.some(s=>s.includes('上限')));
+  }finally{await bot.stopWorker();}
+});
+
+test('saved generated image survives restart and refreshes expired media without a model call',async(t)=>{
+  const dbConfig=testDatabase();const store=await MessageStore.open(dbConfig);
+  const {renderSvg}=await import('../lib/image-generation.ts');
+  const image=await renderSvg('<svg><circle cx="400" cy="400" r="200" fill="red"/></svg>');
+  await add(store);const job=(await store.nextJobs(1))[0];
+  await store.saveReply(job,undefined,[image]);await store.setMedia(job,0,'old',Date.now()+60000);await store.close();
+  clearTokenCache();let models=0,uploads=0,sends=0;
+  t.mock.method(globalThis,'fetch',async(url:string|URL|Request,init?:RequestInit)=>{
+    const path=new URL(String(url)).pathname;
+    if(path.endsWith('/gettoken'))return Response.json({errcode:0,access_token:'token',expires_in:7200});
+    if(path.endsWith('/media/upload')){uploads++;return Response.json({media_id:'fresh'});}
+    assert.ok(path.endsWith('/send_msg'));sends++;
+    const body=JSON.parse(String(init?.body));assert.equal(body.image.media_id,sends===1?'old':'fresh');
+    return Response.json({errcode:sends===1?40007:0});
+  });
+  const worker=await MessageWorker.create({...cfg,...dbConfig},async()=>{models++;return{chunks:['unexpected']};});
+  try{worker.start();await until(async()=>await worker.store.pendingCount()===0);assert.equal(models,0);assert.equal(uploads,1);assert.equal(sends,2);}
+  finally{await worker.stop();}
+});

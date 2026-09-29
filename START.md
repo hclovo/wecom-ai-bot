@@ -68,3 +68,17 @@ docker compose stop wecom-ai-bot
 修改 `.env` 或更新代码后，Docker 重新运行 `./start.sh docker`；直接运行则 Ctrl+C 后重新 `./start.sh`。同一数据库 schema 仅允许一个机器人实例。
 
 已有 SQLite 文件不会使用、迁移或删除。数据库备份恢复由 PostgreSQL 工具处理，详见 DEPLOY 第 10 节。
+
+
+## 使用 SVG 绘图
+
+更新代码后重新执行 `./start.sh docker`（本机运行用 `./start.sh`）。在微信里发送：
+
+```text
+/draw 一只穿宇航服的猫，简洁卡通风格
+画图：用户下单到付款成功的流程图
+```
+
+默认复用已配置的文本模型，不用额外生图 API。可在 .env 添加 `SVG_MODEL=同一文本接口中的模型ID` 和 `SVG_TIMEOUT_MS=120000`，不填则使用默认值。已有聊天模型需要能按提示输出完整 SVG。
+
+升级前先备份 PostgreSQL；本版自动将 schema 升至 2，保留旧文本待发记录。Docker 构建会安装 SVG 渲染依赖和中文字体。已有 95018 问题仍需根据日志的 service_state 排查，生成图片成功不代表微信一定允许发送。

@@ -1,6 +1,7 @@
 import { Pool } from 'pg';
 import type { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { createHash } from 'node:crypto';
+import type { ReplyChunk } from './reply-types.ts';
 import type { KfMessage } from './wecom-api.ts';
 
 export interface DatabaseConfig {
@@ -15,7 +16,7 @@ export interface Job {
   status: string; attempts: number; charged: number;
 }
 export interface SyncJob { kfid: string; cursor: string; revision: number; attempts: number }
-export interface ReplyPart { part: number; msgid: string; content: string }
+export interface ReplyPart { part: number; msgid: string; content: string; kind: 'text' | 'image'; media_id: string | null; media_expires_at: string | null }
 
 export function databaseConfig(env: NodeJS.ProcessEnv = process.env): DatabaseConfig {
   const databaseUrl = env.DATABASE_URL || '';
@@ -80,7 +81,7 @@ export class MessageStore {
           await client.query(`CREATE SCHEMA IF NOT EXISTS "${cfg.databaseSchema}"`);
           await client.query('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)');
           const versions = await client.query<{ version: number }>('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1');
-          if ((versions.rows[0]?.version ?? 0) > 1) throw new Error('数据库版本高于程序版本，拒绝启动');
+          if ((versions.rows[0]?.version ?? 0) > 2) throw new Error('数据库版本高于程序版本，拒绝启动');
           if (!versions.rows.length) {
             await client.query(`
               CREATE TABLE sessions (user_key TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at BIGINT NOT NULL);
@@ -105,12 +106,18 @@ export class MessageStore {
               INSERT INTO schema_migrations VALUES (1);
             `);
           }
+          if ((versions.rows[0]?.version ?? 0) < 2) {
+            await client.query(`ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'text',
+              ADD COLUMN media_id TEXT, ADD COLUMN media_expires_at BIGINT;
+              ALTER TABLE outbox ADD CONSTRAINT outbox_kind CHECK (kind IN ('text','image'));
+              INSERT INTO schema_migrations VALUES (2);`);
+          }
           await client.query("UPDATE inbox SET status='pending' WHERE status='processing'");
         });
       } else {
         // Admin tools must not acquire a worker lease, migrate, or recover in-flight jobs.
         const version = await store.query<{ version: number }>('SELECT max(version) AS version FROM schema_migrations');
-        if (version.rows[0]?.version !== 1) throw new Error('不支持的数据库版本，请先启动对应版本服务');
+        if (version.rows[0]?.version !== 2) throw new Error('不支持的数据库版本，请先启动对应版本服务');
       }
       return store;
     } catch (error) { await store.close(); throw error; }
@@ -190,7 +197,7 @@ export class MessageStore {
       return true;
     });
   }
-  async saveReply(job: Job, session: string | undefined, chunks: string[]): Promise<void> {
+  async saveReply(job: Job, session: string | undefined, chunks: ReplyChunk[]): Promise<void> {
     await this.transaction(async (client) => {
       const row = await client.query('SELECT status FROM inbox WHERE id=$1 FOR UPDATE', [job.id]);
       if (!row.rows.length) throw new Error('消息任务不存在');
@@ -199,18 +206,23 @@ export class MessageStore {
       if (['reply_ready', 'sent', 'failed'].includes(row.rows[0].status)) return;
       if (session !== undefined) await client.query('INSERT INTO sessions VALUES($1,$2,$3) ON CONFLICT(user_key) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at',
         [job.user_key, session, Date.now()]);
-      for (const [part, content] of chunks.entries()) {
+      for (const [part, chunk] of chunks.entries()) {
+        const kind = typeof chunk === 'string' ? 'text' : 'image';
+        const content = typeof chunk === 'string' ? chunk : chunk.base64;
         const msgid = createHash('sha256').update(JSON.stringify([job.kfid, job.msgid, part])).digest('hex').slice(0, 32);
-        await client.query('INSERT INTO outbox(job_id,part,msgid,content) VALUES($1,$2,$3,$4)', [job.id, part, msgid, content]);
+        await client.query('INSERT INTO outbox(job_id,part,msgid,content,kind) VALUES($1,$2,$3,$4,$5)', [job.id, part, msgid, content, kind]);
       }
       await client.query("UPDATE inbox SET status=$1,attempts=0,next_at=0,payload='{}' WHERE id=$2", [chunks.length ? 'reply_ready' : 'sent', job.id]);
     });
   }
   async parts(job: Job): Promise<ReplyPart[]> {
-    return (await this.query<ReplyPart>('SELECT part,msgid,content FROM outbox WHERE job_id=$1 AND sent=0 ORDER BY part', [job.id])).rows;
+    return (await this.query<ReplyPart>('SELECT part,msgid,content,kind,media_id,media_expires_at FROM outbox WHERE job_id=$1 AND sent=0 ORDER BY part', [job.id])).rows;
+  }
+  async setMedia(job: Job, part: number, mediaId: string, expiresAt: number): Promise<void> {
+    await this.query('UPDATE outbox SET media_id=$1,media_expires_at=$2 WHERE job_id=$3 AND part=$4 AND sent=0', [mediaId, expiresAt, job.id, part]);
   }
   async markPart(job: Job, part: number): Promise<void> {
-    await this.query("UPDATE outbox SET sent=1,content='' WHERE job_id=$1 AND part=$2", [job.id, part]);
+    await this.query("UPDATE outbox SET sent=1,content='',media_id=NULL,media_expires_at=NULL WHERE job_id=$1 AND part=$2", [job.id, part]);
   }
   async done(job: Job): Promise<void> { await this.query("UPDATE inbox SET status='sent' WHERE id=$1", [job.id]); }
   async defer(job: Job, delay: number, terminal: boolean): Promise<void> {

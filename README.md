@@ -2,7 +2,7 @@
 
 通过企业微信「微信客服」让微信好友扫码与 AI 对话。支持文本多轮、图片、PDF 和文本文件，方舟文档理解使用 Files + Responses API。**Word/Excel/PPT 目前需先导出 PDF**，不直接上传 Office 文件。
 
-Node ≥ 24.0，TypeScript 源码直接运行，使用 `pg` 驱动连接 PostgreSQL（本地验证版本 17）。同一数据库 schema 仅允许一个机器人进程，启动时通过数据库锁强制执行。当前不使用 SQLite。
+Node ≥ 24.0，TypeScript 源码直接运行，使用 `pg` 驱动连接 PostgreSQL，使用 sharp 和 XML 解析器渲染 SVG（本地验证版本 17）。同一数据库 schema 仅允许一个机器人进程，启动时通过数据库锁强制执行。当前不使用 SQLite。
 
 [启动指南 START.md](START.md) ｜ [需求](REQUIREMENTS.md) ｜ [进度](PROGRESS.md) ｜ [部署与 IP 联调](DEPLOY.md)
 
@@ -39,6 +39,7 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 | `/del 编号` | 删除会话，至少保留一个 |
 | `/reset` | 清空当前历史与文件目标 |
 | `/help` | 显示指令 |
+| `/draw 描述` | 文本模型生成 SVG，渲染后发送图片 |
 
 会话 #1 是初始默认会话，也可以删除或淘汰。首条文字为默认会话命名。每个客服账号、好友的状态独立，默认保留最近 12 个完整轮次，同时有历史字符预算。
 
@@ -82,7 +83,7 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 
 ## 实现与验证边界
 
-真实 PostgreSQL 17 上的 28 项本地测试和类型检查通过；尚未完成真实企业微信/方舟/云服务器联调。媒体默认路径为 `/cgi-bin/media/get`，可通过 `WECOM_MEDIA_PATH` 调整，需在目标账号核验。Office 转换与语音为待办。
+真实 PostgreSQL 17 上的 41 项本地测试和类型检查通过；尚未完成真实企业微信/方舟/云服务器联调。媒体默认路径为 `/cgi-bin/media/get`，可通过 `WECOM_MEDIA_PATH` 调整，需在目标账号核验。Office 转换与语音为待办。
 
 方舟上传参数使用 `purpose=user_data`，文档输入限制依据 [Files API 官方说明](https://docs.volcengine.com/docs/ark/file-api?lang=zh)。PostgreSQL 事务通过单一连接执行，参见 [node-postgres 事务文档](https://node-postgres.com/features/transactions)。
 
@@ -90,3 +91,16 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 数据库配置：`DATABASE_URL` 必填；`DATABASE_SCHEMA=wecom_bot`、`DATABASE_POOL_SIZE=10`、`DATABASE_TIMEOUT_MS=2000` 可调整。schema 标识符仅允许小写字母、数字和下划线。使用直连或会话池模式，不能使用事务池模式的 PgBouncer（单实例锁属于数据库会话）。锁连接断开后主程序停止工作并退出，由 Compose/systemd 重启后恢复。
 
 旧 SQLite 文件不会读取、转换或删除；如果已有需保留的历史数据，应另行执行显式迁移。历史审查报告中的 SQLite 描述仅代表当时版本。
+
+
+## SVG 绘图
+
+直接发送 `/draw 一只穿宇航服的猫`、`画图：订单处理流程图` 或 `帮我画一张生日贺卡`。使用现有文本模型生成 SVG，经白名单校验后渲染为 1024×1024 JPEG 并发回微信。适合流程图、信息图、图标、简洁插画；不适合写实照片，也不支持基于上传图片的编辑。
+
+默认复用 LLM_MODEL/LLM_BASE_URL/LLM_API_KEY；可设置 SVG_MODEL（同一接口下的文本模型）和 SVG_TIMEOUT_MS。**不需要图片生成模型、图片 API Key 或对象存储**。仍会产生文本模型调用费用，/draw 纳入每日请求限额。
+
+禁止 SVG 脚本、样式表、外部图片/链接、实体声明和嵌入 HTML；固定画布并限制 SVG 大小/层级/节点数及渲染时间。图片临时保存到 PostgreSQL outbox，发送成功后清除图片正文；失败或重启使用已保存图片重发，微信 media_id 过期时重新上传，不重新调用模型。
+
+Docker 镜像包含中文字体。直接在 Linux 上运行时，需要自行安装中文字体（例如 Noto Sans CJK），否则文字可能显示为方框。升级涉及数据库 schema 1→2，请先备份 PostgreSQL；迁移保留已有文本任务，旧应用版本不能直接打开升级后的库。
+
+对于 95018，默认仅查询状态并诊断。若确认采用机器人接待，可显式设置 WECOM_AUTO_TAKEOVER=true：仅当发送失败后查询到 state=0 时尝试转到 state=1，再用原 msgid 重试一次；不强制转出人工、排队或已结束会话。该操作仍受微信实际账号权限及会话规则限制，不保证解决所有 95018。
