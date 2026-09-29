@@ -1,5 +1,7 @@
 import { cursorCompletion } from './cursor-agent.ts';
-import { requestJson, errorCode } from './http-client.ts';
+import { errorCode } from './http-client.ts';
+import { modelStream } from './model-stream.ts';
+import type { ModelActivity } from './model-stream.ts';
 // 调用 OpenAI 兼容的 chat completions 接口（火山方舟 /api/v3 即此协议）
 
 export type ChatContentPart =
@@ -19,7 +21,7 @@ export interface HistoryMessage {
   content: string;
 }
 
-export interface ChatOptions {
+export interface ChatOptions extends ModelActivity {
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -45,12 +47,25 @@ export async function chatCompletion(options: ChatOptions): Promise<string> {
 async function apiCompletion(options: ChatOptions): Promise<string> {
   const { baseUrl, apiKey, model, systemPrompt, history, timeoutMs } = options;
   const messages = [{ role: 'system', content: systemPrompt }, ...history];
-  const data = await requestJson<{ choices?: Array<{ message?: { content?: unknown } }> }>(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+  let streamed = '', complete = false;
+  const data = await modelStream(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ model, messages, temperature: 0.8 }),
-  }, { timeoutMs: timeoutMs ?? 300000 });
+    body: JSON.stringify({ model, messages, temperature: 0.8, stream: true }),
+  }, { timeoutMs, onActivity: options.onActivity, onEvent: event => {
+    if (event.error) throw new Error('模型流式调用失败');
+    const choice = event.choices?.[0];
+    const delta = choice?.delta;
+    if (typeof delta?.content === 'string' && delta.content) { streamed += delta.content; options.onText?.(streamed); }
+    if (choice?.finish_reason) { if (choice.finish_reason !== 'stop') throw new Error('模型回复不完整'); complete = true; }
+    return !!(delta?.content || delta?.reasoning_content || delta?.reasoning || choice?.finish_reason);
+  } });
+  if (!data) {
+    if (!complete || !streamed) throw new Error('模型回复不完整');
+    return streamed;
+  }
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== 'string' || content === '') throw new Error('LLM 返回异常');
+  options.onText?.(content);
   return content;
 }

@@ -25,6 +25,13 @@ if(!permissions.deny.includes('Shell(*)')||!permissions.deny.includes('Read(/**)
 let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>input+=c);
 process.stdin.on('end',()=>{
  const model=args[args.indexOf('--model')+1];
+ if(model==='streaming'){
+   let n=0;const timer=setInterval(()=>{
+     if(++n<10)console.log(JSON.stringify({type:'thinking',subtype:'delta',text:'PRIVATE_THOUGHT'}));
+     else {clearInterval(timer);console.log(JSON.stringify({type:'assistant',message:{content:[{type:'text',text:'hello'}]}}));console.log(JSON.stringify({type:'result',result:'hello'}));}
+   },100);return;
+ }
+ if(model==='stderr'){setInterval(()=>console.error('noise'),20);return;}
  if(model==='timeout'){setInterval(()=>{},1000);return;}
  if(model==='fail'){console.error('PRIVATE_SECRET_FROM_REMOTE');process.exit(9);}
  if(model==='malformed'){console.log('not json');return;}
@@ -230,4 +237,16 @@ test('image diagnostics distinguish event shapes and expose only metadata in nor
   }}));
   assert.deepEqual(failedImage.imageTools, [{status:'error',error:'EACCES permission denied [URL]',resultFields:['error']}]);
   assert.ok(!JSON.stringify(failedImage).includes('PRIVATE_PROMPT'));
+});
+
+
+test('Cursor streaming events reset the idle deadline but stderr does not', async () => {
+  const f = await fixture();
+  try {
+    let events = 0; const publicText: string[] = [];
+    const options = { ...f, timeoutMs: 600, systemPrompt: 'test', history: [{ role: 'user' as const, content: 'test' }] };
+    assert.equal(await cursorCompletion({ ...options, model: 'streaming', onActivity: () => events++, onText: text => publicText.push(text) }), 'hello');
+    assert.ok(events >= 5); assert.deepEqual(publicText, ['hello']);
+    await assert.rejects(cursorCompletion({ ...options, model: 'stderr' }), /CURSOR_TIMEOUT/);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
 });

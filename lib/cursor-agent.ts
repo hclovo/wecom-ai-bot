@@ -3,9 +3,10 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, open, realpath } from 'node:fs
 import { constants } from 'node:fs';
 import { join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { tmpdir } from 'node:os';
+import type { ModelActivity } from './model-stream.ts';
 import type { ChatMessage } from './llm.ts';
 
-export interface CursorOptions { cursorBin?: string; cursorStateDir?: string; model?: string; timeoutMs?: number }
+export interface CursorOptions extends ModelActivity { cursorBin?: string; cursorStateDir?: string; model?: string; timeoutMs?: number }
 const DENY = ['Read(**)', 'Read(/**)', 'Write(**)', 'Write(/**)', 'Shell(*)', 'WebFetch(*)', 'Mcp(*:*)'];
 const MAX_OUTPUT = 2 * 1024 * 1024;
 const activeRequests = new Set<() => void>();
@@ -39,8 +40,8 @@ export async function cursorGenerateImage(options: CursorOptions & { prompt: str
     await writeFile(join(workspace, '.cursor', 'cli.json'), JSON.stringify({ permissions }), { mode: 0o600 });
     await writeFile(join(workspace, '.cursor', 'mcp.json'), '{"mcpServers":{}}', { mode: 0o600 });
     const output = await runCaptured(options.cursorBin || 'cursor-agent', [
-      '--print', '--output-format', 'stream-json', '--trust', '--workspace', workspace, '--model', options.model || 'auto',
-    ], env, workspace, `生成图片：${options.prompt}\n保存到 assets/ 目录。`, options.timeoutMs ?? 300000, 48 * 1024 * 1024);
+      '--print', '--output-format', 'stream-json', '--stream-partial-output', '--trust', '--workspace', workspace, '--model', options.model || 'auto',
+    ], env, workspace, `生成图片：${options.prompt}\n保存到 assets/ 目录。`, options.timeoutMs ?? 600000, 48 * 1024 * 1024, options);
     const diagnostic = imageRunDiagnostic(output);
     options.onDiagnostic?.(diagnostic);
     try { return await readGeneratedImage(output, workspace); }
@@ -211,7 +212,7 @@ export async function cursorEnvironment(options: CursorOptions): Promise<NodeJS.
     AGENT_CLI_CREDENTIAL_STORE: 'file', NO_OPEN_BROWSER: '1' };
 }
 
-async function runCaptured(bin: string, args: string[], env: NodeJS.ProcessEnv, cwd: string, input: string, timeoutMs: number, maxOutput = MAX_OUTPUT): Promise<string> {
+async function runCaptured(bin: string, args: string[], env: NodeJS.ProcessEnv, cwd: string, input: string, timeoutMs: number, maxOutput = MAX_OUTPUT, activity?: ModelActivity): Promise<string> {
   return new Promise((resolveResult, reject) => {
     const child = spawn(bin, args, { cwd, env, shell: false, detached: process.platform !== 'win32', stdio: ['pipe','pipe','pipe'] });
     let stdout = '', total = 0;
@@ -222,12 +223,29 @@ async function runCaptured(bin: string, args: string[], env: NodeJS.ProcessEnv, 
     };
     const cancel = () => { failure = new CursorAgentError('CURSOR_PROCESS_FAILED'); kill(); };
     activeRequests.add(cancel);
-    const timer = setTimeout(() => { failure = new CursorAgentError('CURSOR_TIMEOUT'); kill(); }, timeoutMs);
+    let timer: ReturnType<typeof setTimeout>;
+    const touch = () => { clearTimeout(timer); timer = setTimeout(() => { failure = new CursorAgentError('CURSOR_TIMEOUT'); kill(); }, timeoutMs); };
+    touch();
+    let pending = '', text = '';
+    const eventLine = (line: string) => {
+      let event: any; try { event = JSON.parse(line); } catch { return; }
+      if (!event || !['assistant', 'thinking', 'tool_call', 'result'].includes(event.type)) return;
+      touch(); activity?.onActivity?.();
+      if (event.type === 'assistant') for (const part of (Array.isArray(event.message?.content) ? event.message.content : [])) {
+        if (part.type === 'text' && typeof part.text === 'string') { text += part.text; activity?.onText?.(text); }
+      }
+    };
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       total += Buffer.byteLength(chunk);
       if (total > maxOutput) { failure = new CursorAgentError('CURSOR_OUTPUT_INVALID'); kill(); }
-      else stdout += chunk;
+      else {
+        stdout += chunk;
+        if (activity) {
+          pending += chunk; let end: number;
+          while ((end = pending.indexOf('\n')) >= 0) { eventLine(pending.slice(0, end)); pending = pending.slice(end + 1); }
+        }
+      }
     });
     child.stderr.on('data', (chunk: Buffer) => { total += chunk.length; if (total > maxOutput) { failure = new CursorAgentError('CURSOR_OUTPUT_INVALID'); kill(); } });
     child.stdin.on('error', () => {}); // process may reject before consuming input
@@ -282,12 +300,12 @@ export async function cursorCompletion(options: CursorOptions & { systemPrompt: 
     await writeFile(join(workspace,'.cursor','cli.json'),JSON.stringify({permissions:{allow:[],deny:DENY}}),{mode:0o600});
     await writeFile(join(workspace,'.cursor','mcp.json'),'{"mcpServers":{}}',{mode:0o600});
     const output = await runCaptured(options.cursorBin || 'cursor-agent', [
-      '--print','--mode','ask','--output-format','json','--trust','--workspace',workspace,
+      '--print','--mode','ask','--output-format','stream-json','--stream-partial-output','--trust','--workspace',workspace,
       '--model',options.model || 'auto',
-    ], env, workspace, `仅根据下面给出的上下文回复最后一条用户消息，遵循 instructions。不要读取文件、执行命令或调用工具。\n${input}`, options.timeoutMs ?? 300000);
+    ], env, workspace, `仅根据下面给出的上下文回复最后一条用户消息，遵循 instructions。不要读取文件、执行命令或调用工具。\n${input}`, options.timeoutMs ?? 600000, MAX_OUTPUT, options);
     let result: { type?: string; is_error?: boolean; result?: unknown };
-    try { result = JSON.parse(output); } catch { throw new CursorAgentError('CURSOR_OUTPUT_INVALID'); }
-    if (result.type !== 'result' || result.is_error || typeof result.result !== 'string' || !result.result.trim()) throw new CursorAgentError('CURSOR_OUTPUT_INVALID');
+    try { result = output.trim().split('\n').map(line => JSON.parse(line)).findLast(event => event.type === 'result'); } catch { throw new CursorAgentError('CURSOR_OUTPUT_INVALID'); }
+    if (!result || result.type !== 'result' || result.is_error || typeof result.result !== 'string' || !result.result.trim()) throw new CursorAgentError('CURSOR_OUTPUT_INVALID');
     return result.result;
   } finally { await rm(workspace, { recursive:true, force:true }); }
 }

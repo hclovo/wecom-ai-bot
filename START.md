@@ -81,7 +81,7 @@ docker compose stop wecom-ai-bot
 画图：用户下单到付款成功的流程图
 ```
 
-默认复用已配置的文本模型，不用额外生图 API。可在 .env 添加 `SVG_MODEL=同一文本接口中的模型ID` 和 `SVG_TIMEOUT_MS=300000`，不填则使用默认值。已有聊天模型需要能按提示输出完整 SVG。
+默认复用已配置的文本模型，不用额外生图 API。可在 .env 添加 `SVG_MODEL=同一文本接口中的模型ID` 和 `SVG_TIMEOUT_MS=600000`，不填则使用默认值。已有聊天模型需要能按提示输出完整 SVG。
 
 升级前先备份 PostgreSQL；本版自动将 schema 升至 3，保留旧文本和图片待发记录。Docker 构建会安装 SVG 渲染依赖和中文字体。已有 95018 问题仍需根据日志的 service_state 排查，生成图片成功不代表微信一定允许发送。
 
@@ -109,7 +109,7 @@ bash start.sh docker
 
 目前支持：文字多轮对话、文本文件摘要/追问、/draw SVG 绘图。图片理解和 PDF 文件问答在 Cursor 模式下会明确提示暂不支持；需要这些功能时切回 `LLM_PROVIDER=api` 并填写原 API 配置。
 
-模型调用通过 Cursor CLI `--print --mode ask --output-format json`，每条消息使用独立临时工作区，不复用其他好友的 CLI 会话。工具权限配置拒绝文件读取/写入、Shell、WebFetch 和 MCP；数据库/微信/API 密钥不传给子进程。聊天上下文仍由 PostgreSQL 管理。
+模型调用通过 Cursor CLI `--print --mode ask --output-format stream-json --stream-partial-output`，每条消息使用独立临时工作区，不复用其他好友的 CLI 会话。工具权限配置拒绝文件读取/写入、Shell、WebFetch 和 MCP；数据库/微信/API 密钥不传给子进程。聊天上下文仍由 PostgreSQL 管理。
 
 如果直接在宿主机启动，先按 [Cursor 官方安装说明](https://cursor.com/docs/cli/installation) 安装 CLI，再运行 `./start.sh`。本机 macOS 的认证存储由 Cursor CLI 管理，可能复用该系统用户已有的 Cursor 登录；服务器建议使用 Docker 的独立状态卷。
 
@@ -127,7 +127,7 @@ IMAGE_PROVIDER=cursor
 CURSOR_FALLBACK=true
 CURSOR_MODEL=auto
 CURSOR_IMAGE_MODEL=auto
-IMAGE_TIMEOUT_MS=300000
+IMAGE_TIMEOUT_MS=600000
 ```
 
 执行 `bash start.sh docker` 重建并启动，按需完成 Cursor 登录。普通聊天可直接说“解释一下这个流程，配一张图”，API 决定文字和配图内容，Cursor 使用内置 GenerateImage 生成图片；`/draw` 同样切到原生生图。API 文字调用失败才使用 Cursor 聊天兜底。不要把 API 接入点 ID 填入 CURSOR_MODEL 或 CURSOR_IMAGE_MODEL。
@@ -151,13 +151,17 @@ docker compose exec wecom-ai-bot node scripts/diagnose-cursor-image.ts
 
 若旧版出现 `Failed to save generated image ... Blocked by permissions configuration`，更新代码并重建即可使用独立绘图权限配置。无需删除 cursor-state 卷或手工清空共享权限：绘图调用会从已有登录配置创建临时副本，放行本次 assets 输出目录，并在结束后删除副本；聊天仍禁止写入。
 
-模型任务默认超时为 5 分钟：`LLM_TIMEOUT_MS=300000`。`CURSOR_TIMEOUT_MS`、`IMAGE_TIMEOUT_MS`、`SVG_TIMEOUT_MS`、`FILE_TASK_TIMEOUT_MS` 未单独设置时继承该值；已有显式配置仍优先，请删除旧值或统一设为 300000。`UPSTREAM_TIMEOUT_MS` 仅控制微信接口请求，默认仍为 30000。超时按调用阶段计算，API 超时后 Cursor 兜底另有 5 分钟；对话后配图也单独计时，不是整条消息 5 分钟总上限。
+模型任务默认无输出超时为 10 分钟：`LLM_TIMEOUT_MS=600000`。`CURSOR_TIMEOUT_MS`、`IMAGE_TIMEOUT_MS`、`SVG_TIMEOUT_MS`、`FILE_TASK_TIMEOUT_MS` 未单独设置时继承该值；已有显式配置仍优先，请删除旧值或统一设为 600000。`UPSTREAM_TIMEOUT_MS` 仅控制微信接口请求，默认仍为 30000。API、Cursor 和图片生成以连续无有效模型输出的时间计时；新文字、思考事件或工具活动会刷新计时，传输心跳不刷新。API 超时后兜底单独计时，不设模型调用总时长上限。PDF 上传/等待就绪保留 FILE_TASK_TIMEOUT_MS 的准备阶段总时限，之后的模型问答使用独立的流式空闲超时。
 
 文件发送无需新增配置：更新后执行 `bash start.sh docker`，启动会迁移到 schema 3。可以直接说“把骑车的鹈鹕做成完整 HTML 动画文件发给我”。生成的文件每轮最多一个，最多 40000 字符且不超过 200KB；旧对话中“只能打字、不能发送文件”的说法不再适用。
 
 
 ## 耗时任务等待提示
 
-任务开始处理后超过 3 秒仍未完成，会先发“正在处理，请稍等，完成后会发给你。”，然后继续处理并发送最终结果。快速回复、会话管理指令及额度不足不会额外提示。每条入站消息最多尝试一次提示，重启及最终回复重试不会重复发送；提示失败不影响任务结果，也不会把模型信息发给用户。
+任务开始处理后超过 3 秒仍未完成，发送等待提示。有新的模型输出或工具活动时，按 `PROGRESS_INTERVAL_MS=30000` 合并发送后续进度，不限制次数；没有新活动时不刷屏。`PROGRESS_NOTICE_MS=0` 关闭反馈。排队阶段不计时。
 
-可设置 `PROGRESS_NOTICE_MS=3000` 调整触发时间，`0` 关闭。计时从任务开始执行起算，排队等待不计入；不会定时刷屏或虚构进度百分比。已发起的提示发送结束后再发最终回复，避免结果之后又出现“正在处理”。等待提示在 outbox 中用 part=-1 记录，不进入聊天历史，也不会作为最终回复重试。
+模型公开答复中的完整文字字段可先发给用户，文件源码、内部思考及工具原始输出不会转发。已提前送达的文字从最终答复中去重，结果消息会等已经发起的进度发送结束后再发送。负数 outbox.part 保存进度尝试和已发送文字，重启可恢复文字前缀；失败的进度不混入最终结果重试。通道拒收进度时停止该任务的进度发送，任务继续生成并尝试发送最终结果。
+
+微信客服通道有自身的回复条数/窗口限制，程序取消次数上限不代表微信允许无限发送。不要把传输心跳、轮询或本机发送的等待提示当作模型输出去刷新模型超时。
+
+若上游忽略 stream 参数并只在完成时返回 JSON，程序无法观察其内部进度，等待期间仍可能触发无输出超时。已有 .env 中显式设置的旧超时值需改为 600000 或删除后使用新默认值。

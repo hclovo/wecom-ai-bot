@@ -1,5 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { requestJson } from './http-client.ts';
+import { modelStream } from './model-stream.ts';
+import type { ModelActivity } from './model-stream.ts';
 // 火山方舟文件理解链路：Files API 上传 → 轮询 active → Responses API 以 file_id 提问
 // LLM_BASE_URL 统一到版本号一层（如 https://ark.cn-beijing.volces.com/api/v3），
 // 三个端点分别为 {base}/chat/completions、{base}/files、{base}/responses
@@ -80,7 +82,7 @@ function extractOutputText(data: ResponsesPayload): string {
   return parts.join('');
 }
 
-export interface AskFileOptions {
+export interface AskFileOptions extends ModelActivity {
   timeoutMs?: number;
   signal?: AbortSignal;
   baseUrl: string;
@@ -92,12 +94,14 @@ export interface AskFileOptions {
 }
 
 // 文档问答：file_id + 提问 + 可选的历史文本消息
-export async function askFile({ baseUrl, apiKey, model, fileId, question, history = [], timeoutMs, signal }: AskFileOptions): Promise<string> {
-  const data = await requestJson<ResponsesPayload>(`${baseUrl.replace(/\/+$/, '')}/responses`, {
+export async function askFile({ baseUrl, apiKey, model, fileId, question, history = [], timeoutMs, signal, onActivity, onText }: AskFileOptions): Promise<string> {
+  let streamed = '', complete = false;
+  const data = await modelStream(`${baseUrl.replace(/\/+$/, '')}/responses`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
       model,
+      stream: true,
       input: [
         ...history.map((m) => ({ role: m.role, content: m.content })),
         {
@@ -109,7 +113,16 @@ export async function askFile({ baseUrl, apiKey, model, fileId, question, histor
         },
       ],
     }),
-  }, { timeoutMs, signal });
+  }, { timeoutMs, signal, onActivity, onEvent: event => {
+    if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) throw new Error('文件问答失败');
+    if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') { streamed += event.delta; onText?.(streamed); }
+    if (event.type === 'response.completed') {
+      complete = true;
+      if (!streamed) streamed = extractOutputText(event.response || {});
+    }
+    return (typeof event.delta === 'string' && event.delta.length > 0) || event.type === 'response.completed';
+  } });
+  if (!data) { if (!complete || !streamed) throw new Error('文件问答返回不完整'); return streamed; }
   const text = extractOutputText(data);
   if (!text) throw new Error('文件问答返回异常');
   return text;

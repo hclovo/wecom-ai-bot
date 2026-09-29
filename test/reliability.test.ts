@@ -467,6 +467,63 @@ test('progress reservation survives restart and commands never receive progress 
   } finally { await worker.stop(); }
 });
 
+test('new activity produces more than two progress notices without a fixed count cap', async t => {
+  clearTokenCache(); const sent: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    sent.push(JSON.parse(String(init?.body)).text.content); return Response.json({ errcode: 0 });
+  });
+  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 10, progressIntervalMs: 20 }, async (_msg, _session, progress) => {
+    const timer = setInterval(() => progress.activity('image'), 10);
+    try { await until(() => sent.length >= 4); return { chunks: ['完成'] }; }
+    finally { clearInterval(timer); }
+  });
+  try {
+    await add(worker.store, [msg('long-active')]); worker.start();
+    await until(async () => await worker.store.pendingCount() === 0);
+    assert.ok(sent.length >= 5); assert.equal(sent.at(-1), '完成');
+  } finally { await worker.stop(); }
+});
+
+test('completed public text is sent during generation and omitted from the final reply', async t => {
+  clearTokenCache(); const sent: string[] = [];
+  let finish!: () => void;
+  const wait = new Promise<void>(resolve => { finish = resolve; });
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    sent.push(JSON.parse(String(init?.body)).text.content); return Response.json({ errcode: 0 });
+  });
+  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 10, progressIntervalMs: 20 }, async (_msg, _session, progress) => {
+    progress.text('第一部分已完成。'); await wait;
+    return { chunks: ['第一部分已完成。', '这是剩余结果。'] };
+  });
+  try {
+    await add(worker.store, [msg('partial')]); worker.start();
+    await until(() => sent.includes('第一部分已完成。'));
+    assert.ok(await worker.store.pendingCount() > 0);
+    finish(); await until(async () => await worker.store.pendingCount() === 0);
+    assert.deepEqual(sent, ['第一部分已完成。', '这是剩余结果。']);
+  } finally { finish(); await worker.stop(); }
+});
+
+test('channel refusal stops progress attempts but generation and final delivery still run', async t => {
+  clearTokenCache(); const sent: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    const text = JSON.parse(String(init?.body)).text.content; sent.push(text);
+    return Response.json(text === '完成' ? { errcode: 0 } : { errcode: 45009 });
+  });
+  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 10, progressIntervalMs: 20 }, async (_msg, _session, progress) => {
+    const timer = setInterval(() => progress.activity(), 10);
+    try { await sleep(120); return { chunks: ['完成'] }; } finally { clearInterval(timer); }
+  });
+  try {
+    await add(worker.store, [msg('channel-limit')]); worker.start();
+    await until(async () => await worker.store.pendingCount() === 0);
+    assert.equal(sent.length, 2); assert.equal(sent.at(-1), '完成');
+  } finally { await worker.stop(); }
+});
+
 test('saved generated image survives restart and refreshes expired media without a model call',async(t)=>{
   const dbConfig=testDatabase();const store=await MessageStore.open(dbConfig);
   const {renderSvg}=await import('../lib/image-generation.ts');

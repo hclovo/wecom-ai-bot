@@ -14,6 +14,7 @@ import { uploadFile, waitFileActive, askFile } from './lib/ark-files.ts';
 import { chatCompletion } from './lib/llm.ts';
 import type { HistoryMessage } from './lib/llm.ts';
 import { conversationReply } from './lib/conversation-reply.ts';
+import type { TaskProgress } from './lib/task-progress.ts';
 import type { ReplyChunk } from './lib/reply-types.ts';
 
 // ---------- 配置 ----------
@@ -51,6 +52,7 @@ export interface Config extends DatabaseConfig {
   fileTaskTimeoutMs: number;
   maxConcurrentJobs: number;
   progressNoticeMs: number;
+  progressIntervalMs: number;
   maxQueueSize: number;
   dailyRequestLimit: number;
   syncPollMs: number;
@@ -79,7 +81,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (env.CURSOR_FALLBACK && !['true','false'].includes(env.CURSOR_FALLBACK)) throw new Error('CURSOR_FALLBACK 必须为 true 或 false');
   const imageProvider = env.IMAGE_PROVIDER || 'svg';
   if (!['svg', 'cursor'].includes(imageProvider)) throw new Error('IMAGE_PROVIDER 必须为 svg 或 cursor');
-  const modelTimeoutMs = Number(env.LLM_TIMEOUT_MS || 300000);
+  const modelTimeoutMs = Number(env.LLM_TIMEOUT_MS || 600000);
   const cfg = {
     llmProvider: provider,
     svgProvider,
@@ -114,6 +116,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     fileTaskTimeoutMs: Number(env.FILE_TASK_TIMEOUT_MS || modelTimeoutMs),
     maxConcurrentJobs: Number(env.MAX_CONCURRENT_JOBS || 2),
     progressNoticeMs: Number(env.PROGRESS_NOTICE_MS ?? 3000),
+    progressIntervalMs: Number(env.PROGRESS_INTERVAL_MS || 30000),
     maxQueueSize: Number(env.MAX_QUEUE_SIZE || 1000),
     dailyRequestLimit: Number(env.DAILY_REQUEST_LIMIT || 100),
     syncPollMs: Number(env.SYNC_POLL_MS || 60000),
@@ -133,7 +136,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length > 0) throw new Error(`缺少配置: ${missing.join(', ')}（参考 .env.example）`);
   for (const key of ['port', 'maxTurns', 'fileMaxMb', 'upstreamTimeoutMs', 'fileTaskTimeoutMs',
-    'llmTimeoutMs', 'imageTimeoutMs', 'nativeImageTimeoutMs', 'cursorTimeoutMs', 'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
+    'progressIntervalMs', 'llmTimeoutMs', 'imageTimeoutMs', 'nativeImageTimeoutMs', 'cursorTimeoutMs', 'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
     if (!Number.isSafeInteger(cfg[key]) || cfg[key] < 1) throw new Error(`配置 ${key} 必须为正整数`);
   }
   if (cfg.port > 65535) throw new Error('PORT 超出范围');
@@ -299,14 +302,15 @@ function cursorFallback(cfg: Config) {
   return cfg.cursorFallback ? { model: cfg.cursorModel, timeoutMs: cfg.cursorTimeoutMs } : undefined;
 }
 
-function drawImage(cfg: Config, prompt: string) {
+function drawImage(cfg: Config, prompt: string, progress?: TaskProgress) {
+  progress?.activity('image');
   if (cfg.imageProvider === 'cursor') return generateNativeImage({ cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
-    model: cfg.cursorImageModel, prompt, timeoutMs: cfg.nativeImageTimeoutMs });
+    model: cfg.cursorImageModel, prompt, timeoutMs: cfg.nativeImageTimeoutMs, onActivity: () => progress?.activity('image') });
   return generateImage({ provider: cfg.svgProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
-    baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.imageModel, prompt, timeoutMs: cfg.imageTimeoutMs });
+    baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, model: cfg.imageModel, prompt, timeoutMs: cfg.imageTimeoutMs, onActivity: () => progress?.activity('image') });
 }
 
-async function handleText(cfg: Config, store: UserStore, conv: Conversation, content: string): Promise<string | ReplyChunk[]> {
+async function handleText(cfg: Config, store: UserStore, conv: Conversation, content: string, progress?: TaskProgress): Promise<string | ReplyChunk[]> {
   if (content.startsWith('/')) return handleCommand(store, conv, content);
   // 首条消息给默认命名的会话起标题
   if (conv.title === '闲聊' && conv.history.length === 0) conv.title = content.slice(0, 12);
@@ -314,6 +318,7 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
     if (cfg.llmProvider === 'cursor') return '暂时无法继续处理这个文件，请发送 /reset 开始新对话。';
     const { fileId, filename } = conv.pendingFile;
     const answer = await askFile({
+      onActivity: () => progress?.activity('file'), onText: text => progress?.text(text),
       timeoutMs: cfg.llmTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
@@ -326,6 +331,7 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
     return answer;
   }
   const answer = await conversationReply({
+    onActivity: () => progress?.activity('reply'), onText: text => progress?.text(text),
     provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
     fallbackCursor: cursorFallback(cfg),
     timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.llmTimeoutMs,
@@ -337,12 +343,12 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
       ...(conv.textFile ? [{ role: 'user' as const, content: `参考文件「${conv.textFile.filename}」：\n${conv.textFile.content}` }] : []),
       ...conv.history, { role: 'user', content },
     ],
-  }, prompt => drawImage(cfg, prompt), cfg.imageProvider === 'cursor' ? 'native' : 'svg');
+  }, prompt => drawImage(cfg, prompt, progress), cfg.imageProvider === 'cursor' ? 'native' : 'svg');
   appendTurn(cfg, conv, content, answer.historyText);
   return answer.chunks;
 }
 
-async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Promise<string | null> {
+async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage, progress?: TaskProgress): Promise<string | null> {
   if (cfg.llmProvider === 'cursor') return '暂时无法识别图片，请用文字描述。';
   const mediaId = msg.image?.media_id;
   if (!mediaId) return null;
@@ -351,6 +357,7 @@ async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Pro
   const mime = buf.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ? 'image/png' : 'image/jpeg';
   const dataUri = `data:${mime};base64,${buf.toString('base64')}`;
   const answer = await chatCompletion({
+    onActivity: () => progress?.activity('reply'), onText: text => progress?.text(text),
     provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
     timeoutMs: cfg.llmTimeoutMs,
     baseUrl: cfg.llmBaseUrl,
@@ -372,7 +379,7 @@ async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Pro
   return answer;
 }
 
-async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Promise<string | null> {
+async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage, progress?: TaskProgress): Promise<string | null> {
   const mediaId = msg.file?.media_id;
   const filename = msg.file?.file_name || '未命名文件';
   if (!mediaId) return null;
@@ -388,6 +395,7 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
       content = `${content.slice(0, TEXT_FILE_CHAR_LIMIT)}\n（文件过长，已截断）`;
     }
     const answer = await chatCompletion({
+    onActivity: () => progress?.activity('reply'), onText: text => progress?.text(text),
       provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
       fallbackCursor: cursorFallback(cfg),
       timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.llmTimeoutMs,
@@ -412,11 +420,11 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
     const up = await uploadFile({ signal, timeoutMs: cfg.llmTimeoutMs, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, buffer: buf, filename });
     await waitFileActive({ signal, timeoutMs: cfg.fileTaskTimeoutMs, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, fileId: up.id });
     const answer = await askFile({
+      onActivity: () => progress?.activity('file'), onText: text => progress?.text(text),
       timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.llmTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
       model: cfg.llmProvider === 'cursor' ? cfg.cursorModel : cfg.llmModel,
-      signal,
       fileId: up.id,
       question: '请用中文简要总结这个文件的要点。',
     });
@@ -433,7 +441,7 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
 // ---------- HTTP 服务 ----------
 
 export async function createServer(cfg: Config) {
-  const worker = await MessageWorker.create(cfg, async (msg, saved) => {
+  const worker = await MessageWorker.create(cfg, async (msg, saved, progress) => {
     const store = getUserStore(saved);
     const conv = getActive(store);
     let reply: string | ReplyChunk[] | null = null;
@@ -442,14 +450,14 @@ export async function createServer(cfg: Config) {
       if (prompt !== null) {
         if (!prompt) return { chunks: ['请描述想画的内容，例如：/draw 一只穿宇航服的猫'] };
         if (prompt.length > 4000) return { chunks: ['画图描述请控制在 4000 字以内。'] };
-        const picture = await drawImage(cfg, prompt);
+        const picture = await drawImage(cfg, prompt, progress);
         appendTurn(cfg, conv, `[画图] ${prompt}`, '[已生成一张图片]');
         return { session: serializeStore(store), chunks: [picture] };
       }
       switch (msg.msgtype) {
-        case 'text': reply = await handleText(cfg, store, conv, (msg.text?.content || '').trim()); break;
-        case 'image': reply = await handleImage(cfg, conv, msg); break;
-        case 'file': reply = await handleFile(cfg, conv, msg); break;
+        case 'text': reply = await handleText(cfg, store, conv, (msg.text?.content || '').trim(), progress); break;
+        case 'image': reply = await handleImage(cfg, conv, msg, progress); break;
+        case 'file': reply = await handleFile(cfg, conv, msg, progress); break;
         case 'voice': reply = '语音消息我还听不了，打字发我吧～'; break;
         case 'video': reply = '视频处理还没上线，先发文字、图片或文档吧'; break;
       }

@@ -225,14 +225,23 @@ export class MessageStore {
   async parts(job: Job): Promise<ReplyPart[]> {
     return (await this.query<ReplyPart>('SELECT part,msgid,content,kind,filename,media_id,media_expires_at FROM outbox WHERE job_id=$1 AND sent=0 AND part>=0 ORDER BY part', [job.id])).rows;
   }
-  // Part -1 records the one best-effort progress attempt. It is never included in
-  // the final reply or retried after restart, even if its delivery was uncertain.
-  async claimProgress(job: Job, content: string): Promise<string | undefined> {
-    const msgid = createHash('sha256').update(JSON.stringify([job.kfid, job.msgid, 'progress'])).digest('hex').slice(0, 32);
+  // Negative parts hold progress attempts: odd = status, even = public answer text.
+  // They are excluded from final-reply retries; sent text is used to avoid duplication.
+  async claimProgress(job: Job, content: string, sequence = 1, publicText = false): Promise<string | undefined> {
+    const part = -(sequence * 2 - (publicText ? 0 : 1));
+    const msgid = createHash('sha256').update(JSON.stringify([job.kfid, job.msgid, 'progress', part])).digest('hex').slice(0, 32);
     const result = await this.query(`INSERT INTO outbox(job_id,part,msgid,content,kind)
-      SELECT id,-1,$2,$3,'text' FROM inbox WHERE id=$1 AND status='processing'
-      ON CONFLICT(job_id,part) DO NOTHING RETURNING msgid`, [job.id, msgid, content]);
+      SELECT id,$4,$2,$3,'text' FROM inbox WHERE id=$1 AND status='processing'
+      ON CONFLICT(job_id,part) DO NOTHING RETURNING msgid`, [job.id, msgid, content, part]);
     return result.rows[0]?.msgid;
+  }
+  async progressText(job: Job): Promise<string> {
+    const rows = await this.query<{content: string}>('SELECT content FROM outbox WHERE job_id=$1 AND part<0 AND part % 2=0 AND sent=1 ORDER BY part DESC', [job.id]);
+    return rows.rows.map(row => row.content).join('');
+  }
+  async markProgress(job: Job, sequence: number, publicText: boolean): Promise<void> {
+    const part = -(sequence * 2 - (publicText ? 0 : 1));
+    await this.query('UPDATE outbox SET sent=1 WHERE job_id=$1 AND part=$2', [job.id, part]);
   }
   async setMedia(job: Job, part: number, mediaId: string, expiresAt: number): Promise<void> {
     await this.query('UPDATE outbox SET media_id=$1,media_expires_at=$2 WHERE job_id=$3 AND part=$4 AND sent=0', [mediaId, expiresAt, job.id, part]);

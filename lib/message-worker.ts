@@ -1,3 +1,5 @@
+import { textPrefix } from './task-progress.ts';
+import type { TaskProgress, ProgressStage } from './task-progress.ts';
 import type { BotReply } from './reply-types.ts';
 import { drawingPrompt } from './image-generation.ts';
 import { MessageStore } from './message-store.ts';
@@ -9,12 +11,12 @@ import { diagnoseSendFailure } from './send-diagnostics.ts';
 
 export interface WorkerConfig extends WecomApiConfig, DatabaseConfig { maxConcurrentJobs: number; maxQueueSize: number; dailyRequestLimit: number;
   syncPollMs: number; retryBaseMs: number; maxSendAttempts: number; retentionDays: number;
-  progressNoticeMs?: number;
+  progressNoticeMs?: number; progressIntervalMs?: number;
 }
 export class MessageWorker {
   store: MessageStore;
   private cfg: WorkerConfig;
-  private handler: (msg: KfMessage, session: string | undefined) => Promise<BotReply>;
+  private handler: (msg: KfMessage, session: string | undefined, progress: TaskProgress) => Promise<BotReply>;
   private timer?: ReturnType<typeof setTimeout>;
   private active = new Map<string, Promise<void>>();
   private syncing?: Promise<void>;
@@ -181,33 +183,70 @@ export class MessageWorker {
     }
   }
   private async handleWithProgress(job: Job, msg: KfMessage, session: string | undefined, enabled: boolean): Promise<BotReply> {
-    let finished = false;
-    let notice: Promise<void> | undefined;
-    const delay = this.cfg.progressNoticeMs ?? 3000;
-    const timer = enabled && delay > 0 ? setTimeout(() => {
-      if (finished || this.closing || !this.store.healthy) return;
+    let finished = false, blocked = false, sequence = 0, version = 0, reported = -1;
+    let stage: ProgressStage = 'reply', publicText = '';
+    let sentText = await this.store.progressText(job);
+    let notice: Promise<void> | undefined, timer: ReturnType<typeof setTimeout> | undefined;
+    const firstDelay = this.cfg.progressNoticeMs ?? 3000;
+    const interval = this.cfg.progressIntervalMs ?? 30000;
+    const progress: TaskProgress = {
+      activity: next => { version++; if (next) stage = next; },
+      text: value => { if (value !== publicText) { publicText = value; version++; } },
+    };
+    const tick = () => {
+      if (finished || blocked || this.closing || !this.store.healthy) return;
       notice = (async () => {
         try {
-          const content = '正在处理，请稍等，完成后会发给你。';
-          const msgid = await this.store.claimProgress(job, content);
-          if (!msgid || finished || this.closing || !this.store.healthy) return;
+          const pending = publicText.startsWith(sentText) ? publicText.slice(sentText.length) : '';
+          if (!pending && version === reported) return;
+          const content = pending ? textPrefix(pending) : stage === 'image' ? '正在生成图片，请稍等。'
+            : stage === 'file' ? '正在处理文件，请稍等。'
+            : reported < 0 ? '正在处理，请稍等，完成后会发给你。' : '仍在整理回复，请稍等。';
+          const publicPart = !!pending;
+          const attempt = ++sequence;
+          const observed = version;
+          const msgid = await this.store.claimProgress(job, content, attempt, publicPart);
+          if (!msgid || finished || this.closing || !this.store.healthy) { reported = observed; return; }
           const [, user] = JSON.parse(job.user_key) as [string, string];
           await sendText({ ...this.cfg, upstreamTimeoutMs: Math.min(this.cfg.upstreamTimeoutMs ?? 30000, 3000) },
             { touser: user, openKfId: job.kfid, msgid, content });
-          await this.store.markPart(job, -1);
-        } catch (error) { console.error('[progress]', errorCode(error)); }
-      })();
-    }, delay) : undefined;
-    timer?.unref();
-    try { return await this.handler(msg, session); }
+          // Track delivery before the database write: a storage fault must not cause
+          // the same public prefix to be sent again within this execution.
+          if (publicPart) sentText += content;
+          reported = observed;
+          await this.store.markProgress(job, attempt, publicPart);
+        } catch (error) {
+          console.error('[progress]', errorCode(error));
+          // Channel refusal stops notices, not generation or final delivery.
+          if (error instanceof WecomApiError) blocked = true;
+        }
+      })().finally(() => {
+        if (!finished && !blocked && !this.closing) { timer = setTimeout(tick, interval); timer.unref(); }
+      });
+    };
+    if (enabled && firstDelay > 0) { timer = setTimeout(tick, firstDelay); timer.unref(); }
+    let result: BotReply;
+    try { result = await this.handler(msg, session, progress); }
     finally {
       finished = true;
       if (timer) clearTimeout(timer);
-      // Finish a notice already in flight before sending the final answer.
-      // This prevents a late "processing" message arriving after the result.
       await notice;
     }
+    if (sentText) {
+      let prefix = '';
+      for (const chunk of result.chunks) { if (typeof chunk !== 'string') break; prefix += chunk; }
+      if (prefix.startsWith(sentText)) {
+        let remaining = sentText.length;
+        result = { ...result, chunks: result.chunks.flatMap(chunk => {
+          if (typeof chunk !== 'string' || remaining === 0) return [chunk];
+          const tail = chunk.slice(remaining); remaining = Math.max(0, remaining - chunk.length);
+          return tail ? [tail] : [];
+        }) };
+      }
+    }
+    return result;
   }
+
   async stop(): Promise<void> {
     this.closing = true;
     clearTimeout(this.timer);
