@@ -103,7 +103,7 @@ Compose 将服务绑定到 `127.0.0.1:8788`，由 Nginx 转发公网回调。已
 
 禁止 SVG 脚本、样式表、外部图片/链接、实体声明和嵌入 HTML；固定画布并限制 SVG 大小/层级/节点数及渲染时间。图片临时保存到 PostgreSQL outbox，发送成功后清除图片正文；失败或重启使用已保存图片重发，微信 media_id 过期时重新上传，不重新调用模型。
 
-Docker 镜像包含中文字体。直接在 Linux 上运行时，需要自行安装中文字体（例如 Noto Sans CJK），否则文字可能显示为方框。升级涉及数据库 schema 1→2，请先备份 PostgreSQL；迁移保留已有文本任务，旧应用版本不能直接打开升级后的库。
+Docker 镜像包含中文字体。直接在 Linux 上运行时，需要自行安装中文字体（例如 Noto Sans CJK），否则文字可能显示为方框。升级涉及数据库 schema 1/2→3，请先备份 PostgreSQL；迁移保留已有文本和图片任务，旧应用版本不能直接打开升级后的库。
 
 对于 95018，默认仅查询状态并诊断。若确认采用机器人接待，可显式设置 WECOM_AUTO_TAKEOVER=true：仅当发送失败后查询到 state=0 时尝试转到 state=1，再用原 msgid 重试一次；不强制转出人工、排队或已结束会话。该操作仍受微信实际账号权限及会话规则限制，不保证解决所有 95018。
 
@@ -128,7 +128,7 @@ IMAGE_PROVIDER=cursor
 CURSOR_FALLBACK=true
 CURSOR_MODEL=auto
 CURSOR_IMAGE_MODEL=auto
-IMAGE_TIMEOUT_MS=180000
+IMAGE_TIMEOUT_MS=300000
 ```
 
 普通聊天由 API 回复，通过结构化回复决定是否配图，例如“解释付款流程，配张图”或接着说“把刚才的过程画出来”。需要配图时，Cursor 在独立临时工作区调用内置 GenerateImage 工具，机器人读取实际生成的位图、转换为微信大小限制内的 JPEG，按文字、图片顺序发送。`/draw` 也使用此通道。原生生图不经过 SVG；只有 `IMAGE_PROVIDER=svg` 才使用旧通道，旧通道的模型可通过 `SVG_PROVIDER=api|cursor` 和 `SVG_MODEL` 独立指定。
@@ -137,4 +137,13 @@ API 文字调用失败时，开启的 `CURSOR_FALLBACK` 会将同一文字上下
 
 运行 `bash start.sh docker` 会在启用任何 Cursor 通道时检查登录。原生生图需要支持 GenerateImage 的较新 Cursor CLI 和账号权限；代码核验基于 CLI 2026.09.18-9a7762b，绘图调用复制登录配置到独立临时配置目录，同时在全局与项目层授予 `GenerateImage(*)` 和本次临时工作区内 assets 目录的写入权限，移除会覆盖该授权的 `Write(**)` / `Write(/**)`。共享登录配置及文字聊天的禁止写入规则保持不变；不启用 `--force` 或 Shell。通过 stream-json 检查 GenerateImage 工具成功事件，优先取回 imageData；没有内嵌数据时，只读取工具返回的本次临时工作区内实际文件路径，并校验真实路径和文件类型。不读取最终回复文字里的路径，不下载模型返回的 URL。模拟 CLI 和数据库测试覆盖路由、图文发送、失败重试及文件校验；真实账号生图和微信收图仍需部署验收。
 
-参考：[Cursor 原生生图说明](https://cursor.com/changelog/page/12)、[CLI 更新日志](https://cursor.com/docs/cli/changelog)。当前接入仍不包含文件附件发送、网络图片检索或上传图片编辑。
+参考：[Cursor 原生生图说明](https://cursor.com/changelog/page/12)、[CLI 更新日志](https://cursor.com/docs/cli/changelog)。当前支持文本类文件附件，仍不包含网络图片检索或上传图片编辑。
+
+
+## 生成文件附件
+
+普通聊天可说“把骑车的鹈鹕做成完整 HTML 动画文件发给我”“把刚才的内容保存成 Markdown”。API 或 Cursor 文字兜底生成结构化文件内容，程序将它作为微信客服 `file` 消息发送，不需要模型读取或写入服务器文件，不执行生成的代码。
+
+目前支持 HTML、TXT、Markdown、CSV、JSON、SVG、CSS、JS、TS、Python、XML、YAML 文本文件，每轮最多一个，最多 40000 字符且不超过 200KB。PDF、Word、Excel、PPT 二进制文件生成尚未实现，不用改扩展名伪装。附件内容暂存在 PostgreSQL outbox；发送成功后清除正文、文件名和素材 ID。会话历史保留生成文件源码以供近期追问修改，沿用历史裁剪和保留期规则。
+
+启动自动升级数据库到 schema 3，新增 outbox.filename 和 file 类型；旧版本不能直接打开升级后的数据库。文件发送失败可重试，重启后继续发送保存的文件，不重新调用模型。接口测试使用模拟微信服务，真实微信附件送达仍需上线确认。

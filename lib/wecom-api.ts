@@ -185,6 +185,26 @@ export function sendImage(cfg: WecomApiConfig, options: { touser: string; openKf
     msgtype: 'image', image: { media_id: options.mediaId } });
 }
 
+export async function uploadFileMedia(cfg: WecomApiConfig, bytes: Buffer, filename: string): Promise<string> {
+  if (!bytes.length || bytes.length > 20 * 1024 * 1024) throw new Error('文件大小超限');
+  if (!filename || Buffer.byteLength(filename) > 180 || /[\\/\u0000-\u001f\u007f]/.test(filename)) throw new Error('文件名无效');
+  return withToken(cfg, async accessToken => {
+    const form = new FormData();
+    form.append('media', new Blob([new Uint8Array(bytes)], { type: 'application/octet-stream' }), filename);
+    const data = await requestJson<{ errcode?: number; media_id?: string }>(
+      `${cfg.apiBase}/cgi-bin/media/upload?access_token=${accessToken}&type=file`, { method: 'POST', body: form },
+      { timeoutMs: cfg.upstreamTimeoutMs });
+    if (data.errcode !== undefined && data.errcode !== 0) throw new WecomApiError('media/upload', { errcode: data.errcode });
+    if (typeof data.media_id !== 'string' || !data.media_id) throw new Error('文件上传未返回 media_id');
+    return data.media_id;
+  });
+}
+
+export function sendFile(cfg: WecomApiConfig, options: { touser: string; openKfId: string; msgid: string; mediaId: string }): Promise<WecomResponse> {
+  return recoverAndSend(cfg, { touser: options.touser, open_kfid: options.openKfId, msgid: options.msgid,
+    msgtype: 'file', file: { media_id: options.mediaId } });
+}
+
 // Media route is configurable for API compatibility; validate against the target account.
 export async function getMedia(cfg: WecomApiConfig, mediaId: string): Promise<Buffer> {
   return withToken(cfg, async (accessToken) => {

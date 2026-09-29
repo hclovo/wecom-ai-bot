@@ -40,7 +40,7 @@ export async function cursorGenerateImage(options: CursorOptions & { prompt: str
     await writeFile(join(workspace, '.cursor', 'mcp.json'), '{"mcpServers":{}}', { mode: 0o600 });
     const output = await runCaptured(options.cursorBin || 'cursor-agent', [
       '--print', '--output-format', 'stream-json', '--trust', '--workspace', workspace, '--model', options.model || 'auto',
-    ], env, workspace, `生成图片：${options.prompt}\n保存到 assets/ 目录。`, options.timeoutMs ?? 180000, 48 * 1024 * 1024);
+    ], env, workspace, `生成图片：${options.prompt}\n保存到 assets/ 目录。`, options.timeoutMs ?? 300000, 48 * 1024 * 1024);
     const diagnostic = imageRunDiagnostic(output);
     options.onDiagnostic?.(diagnostic);
     try { return await readGeneratedImage(output, workspace); }
@@ -284,7 +284,7 @@ export async function cursorCompletion(options: CursorOptions & { systemPrompt: 
     const output = await runCaptured(options.cursorBin || 'cursor-agent', [
       '--print','--mode','ask','--output-format','json','--trust','--workspace',workspace,
       '--model',options.model || 'auto',
-    ], env, workspace, `仅根据下面给出的上下文回复最后一条用户消息，遵循 instructions。不要读取文件、执行命令或调用工具。\n${input}`, options.timeoutMs ?? 120000);
+    ], env, workspace, `仅根据下面给出的上下文回复最后一条用户消息，遵循 instructions。不要读取文件、执行命令或调用工具。\n${input}`, options.timeoutMs ?? 300000);
     let result: { type?: string; is_error?: boolean; result?: unknown };
     try { result = JSON.parse(output); } catch { throw new CursorAgentError('CURSOR_OUTPUT_INVALID'); }
     if (result.type !== 'result' || result.is_error || typeof result.result !== 'string' || !result.result.trim()) throw new CursorAgentError('CURSOR_OUTPUT_INVALID');

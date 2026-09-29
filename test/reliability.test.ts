@@ -13,7 +13,7 @@ import { encrypt, sha1Signature } from '../lib/wecom-crypto.ts';
 const cfg = loadConfig({ WECOM_CORP_ID: 'corp', WECOM_KF_SECRET: 'SECRET', WECOM_TOKEN: 'token',
   WECOM_ENCODING_AES_KEY: Buffer.alloc(32, 1).toString('base64').slice(0,43),
   WECOM_OPEN_KFID: 'kf', LLM_BASE_URL: 'https://mock', LLM_API_KEY: 'LLM_SECRET', LLM_MODEL: 'model',
-  ...databaseEnv(), RETRY_BASE_MS: '10', UPSTREAM_TIMEOUT_MS: '100', SYNC_POLL_MS: '60000', MAX_HISTORY_TURNS: '2',
+  ...databaseEnv(), RETRY_BASE_MS: '10', UPSTREAM_TIMEOUT_MS: '100', LLM_TIMEOUT_MS: '100', SYNC_POLL_MS: '60000', MAX_HISTORY_TURNS: '2',
 });
 const msg = (id: string, user = 'user', content = 'hello') => ({ msgid: id, external_userid: user, origin: 3, msgtype: 'text', text: { content } });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -332,6 +332,73 @@ console.log(JSON.stringify({type:'result',result:'完成'}));
     assert.match(session!, /已生成配图/);
     assert.ok(!session!.includes('image_prompt'));
   } finally { await bot.stopWorker(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('HTML attachment sends after text, refreshes expired media, retries without regeneration and clears delivered content', async t => {
+  clearTokenCache(); let models = 0, uploads = 0, sends = 0, texts = 0;
+  const ids: string[] = [];
+  const html = '<!doctype html><meta charset="utf-8"><h1>骑车的鹈鹕</h1>';
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname.endsWith('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    if (parsed.pathname.endsWith('/chat/completions')) {
+      models++;
+      return Response.json({ choices: [{ message: { content: JSON.stringify({ text: '文件做好了。', image_prompt: null,
+        files: [{ filename: '动画.html', content: html }] }) } }] });
+    }
+    if (parsed.pathname.endsWith('/media/upload')) {
+      uploads++; assert.equal(parsed.searchParams.get('type'), 'file');
+      const media = (init!.body as FormData).get('media') as File;
+      assert.equal(media.name, '动画.html'); assert.equal(await media.text(), html);
+      return Response.json({ media_id: `file-${uploads}` });
+    }
+    assert.ok(parsed.pathname.endsWith('/send_msg'));
+    const body = JSON.parse(String(init?.body));
+    if (body.msgtype === 'text') { texts++; assert.equal(body.text.content, '文件做好了。'); }
+    else {
+      assert.equal(body.msgtype, 'file'); sends++; ids.push(body.msgid);
+      assert.equal(body.file.media_id, sends === 1 ? 'file-1' : 'file-2');
+      if (sends === 1) return Response.json({ errcode: 40007 });
+      if (sends === 2) return new Response('', { status: 503 });
+    }
+    return Response.json({ errcode: 0 });
+  });
+  const db = testDatabase(); const bot = await createServer({ ...cfg, ...db });
+  try {
+    await add(bot.worker.store, [msg('html', 'user', '把骑车的鹈鹕发成HTML文件')]); bot.worker.start();
+    await until(async () => await bot.worker.store.pendingCount() === 0, 10000);
+    assert.equal(models, 1); assert.equal(uploads, 2); assert.equal(texts, 1); assert.equal(sends, 3);
+    assert.equal(new Set(ids).size, 1);
+    assert.match((await bot.worker.store.session(JSON.stringify(['kf', 'user'])))!, /骑车的鹈鹕/);
+    const { Pool } = await import('pg'); const pool = new Pool({ connectionString: db.databaseUrl });
+    try {
+      const row = (await pool.query(`SELECT content,filename,media_id,sent FROM "${db.databaseSchema}".outbox WHERE kind='file'`)).rows[0];
+      assert.deepEqual(row, { content: '', filename: null, media_id: null, sent: 1 });
+    } finally { await pool.end(); }
+  } finally { await bot.stopWorker(); }
+});
+
+test('saved file attachment survives restart with its filename and no model invocation', async t => {
+  const db = testDatabase(); const store = await MessageStore.open(db);
+  const { textFileReply } = await import('../lib/file-reply.ts');
+  await add(store, [msg('saved-file')]); const job = (await store.nextJobs(1))[0];
+  await store.saveReply(job, 'session', ['done', textFileReply('example.html', '<html>hello</html>')]);
+  await store.markPart(job, 0); await store.close();
+  clearTokenCache(); let sent = 0;
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    const path = new URL(String(url)).pathname;
+    if (path.endsWith('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    if (path.endsWith('/media/upload')) {
+      assert.equal(((init!.body as FormData).get('media') as File).name, 'example.html');
+      return Response.json({ media_id: 'saved-file-media' });
+    }
+    assert.ok(path.endsWith('/send_msg')); assert.equal(JSON.parse(String(init?.body)).msgtype, 'file'); sent++;
+    return Response.json({ errcode: 0 });
+  });
+  let models = 0;
+  const worker = await MessageWorker.create({ ...cfg, ...db }, async () => { models++; throw new Error('must not regenerate'); });
+  try { worker.start(); await until(async () => await worker.store.pendingCount() === 0); assert.equal(models, 0); assert.equal(sent, 1); }
+  finally { await worker.stop(); }
 });
 
 test('saved generated image survives restart and refreshes expired media without a model call',async(t)=>{

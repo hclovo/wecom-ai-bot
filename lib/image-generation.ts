@@ -24,6 +24,8 @@ export function drawingPrompt(text: string): string | null {
   if (command) return (command[1] || '').trim();
   const chinese = text.trim().match(/^(?:画图|绘图|生成图片)\s*[:：]\s*([\s\S]*)$/);
   if (chinese) return chinese[1].trim();
+  // A request for an HTML animation or source file belongs to normal artifact chat.
+  if (/\bhtml?\b|文件|网页|代码|附件/i.test(text)) return null;
   const natural = text.trim().match(/^(?:请)?(?:帮我|给我)画(?:一张|一幅|一个|一只)?\s*([\s\S]+)$/)
     || text.trim().match(/^(?:请)?画(?:一张|一幅|一个|一只)\s*([\s\S]+)$/);
   return natural ? natural[1].trim() : null;

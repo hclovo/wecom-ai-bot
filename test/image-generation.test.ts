@@ -11,6 +11,7 @@ test('drawing routes explicit commands and natural requests, not normal chat',()
   for(const text of ['/draw 猫','画图：猫','帮我画一只猫','给我画一张猫','画一只猫']) assert.equal(drawingPrompt(text),'猫');
   assert.equal(drawingPrompt('/draw'),'');assert.equal(drawingPrompt('/drawback x'),null);
   assert.equal(drawingPrompt('你能画图吗？'),null);assert.equal(drawingPrompt('这张画是什么风格'),null);
+  assert.equal(drawingPrompt('帮我画一个骑车的鹈鹕，生成 HTML 文件'),null);
 });
 
 const SVG='<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024"><rect x="10" y="10" width="500" height="500" fill="#08a"/><text x="50" y="120" font-size="40">你好 &amp; SVG</text></svg>';

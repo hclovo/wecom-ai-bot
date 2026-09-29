@@ -49,7 +49,7 @@ async function apiCompletion(options: ChatOptions): Promise<string> {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({ model, messages, temperature: 0.8 }),
-  }, { timeoutMs });
+  }, { timeoutMs: timeoutMs ?? 300000 });
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== 'string' || content === '') throw new Error('LLM 返回异常');
   return content;

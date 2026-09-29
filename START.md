@@ -81,9 +81,9 @@ docker compose stop wecom-ai-bot
 画图：用户下单到付款成功的流程图
 ```
 
-默认复用已配置的文本模型，不用额外生图 API。可在 .env 添加 `SVG_MODEL=同一文本接口中的模型ID` 和 `SVG_TIMEOUT_MS=120000`，不填则使用默认值。已有聊天模型需要能按提示输出完整 SVG。
+默认复用已配置的文本模型，不用额外生图 API。可在 .env 添加 `SVG_MODEL=同一文本接口中的模型ID` 和 `SVG_TIMEOUT_MS=300000`，不填则使用默认值。已有聊天模型需要能按提示输出完整 SVG。
 
-升级前先备份 PostgreSQL；本版自动将 schema 升至 2，保留旧文本待发记录。Docker 构建会安装 SVG 渲染依赖和中文字体。已有 95018 问题仍需根据日志的 service_state 排查，生成图片成功不代表微信一定允许发送。
+升级前先备份 PostgreSQL；本版自动将 schema 升至 3，保留旧文本和图片待发记录。Docker 构建会安装 SVG 渲染依赖和中文字体。已有 95018 问题仍需根据日志的 service_state 排查，生成图片成功不代表微信一定允许发送。
 
 
 ## Cursor 账号登录模式
@@ -127,12 +127,12 @@ IMAGE_PROVIDER=cursor
 CURSOR_FALLBACK=true
 CURSOR_MODEL=auto
 CURSOR_IMAGE_MODEL=auto
-IMAGE_TIMEOUT_MS=180000
+IMAGE_TIMEOUT_MS=300000
 ```
 
 执行 `bash start.sh docker` 重建并启动，按需完成 Cursor 登录。普通聊天可直接说“解释一下这个流程，配一张图”，API 决定文字和配图内容，Cursor 使用内置 GenerateImage 生成图片；`/draw` 同样切到原生生图。API 文字调用失败才使用 Cursor 聊天兜底。不要把 API 接入点 ID 填入 CURSOR_MODEL 或 CURSOR_IMAGE_MODEL。
 
-未设置 IMAGE_PROVIDER 时仍使用原来的 SVG 方式。SVG_MODEL、SVG_PROVIDER、SVG_TIMEOUT_MS 只控制 SVG 方式，不影响原生生图。原生生图失败会明确提示，不偷偷改成 SVG。图片理解/PDF 问答仍由 API 处理；文件附件发送尚未实现。
+未设置 IMAGE_PROVIDER 时仍使用原来的 SVG 方式。SVG_MODEL、SVG_PROVIDER、SVG_TIMEOUT_MS 只控制 SVG 方式，不影响原生生图。原生生图失败会明确提示，不偷偷改成 SVG。图片理解/PDF 问答仍由 API 处理；支持生成 HTML、文本及代码文件附件，暂不支持生成 PDF/Office 二进制附件。
 
 验收：发送普通文字、要求配图的文字和 `/draw` 各一条，确认微信收到真正的图片；在测试环境模拟 API 失败确认 Cursor 兜底。日志 `[llm-fallback]` 表示触发兜底，`[conversation-draw]`/`[draw]` 表示生图失败，`CURSOR_IMAGE_NOT_CALLED` 表示没有观测到原生生图工具调用；`CURSOR_IMAGE_TOOL_FAILED` 表示工具明确返回错误；`CURSOR_IMAGE_RESULT_UNRECOGNIZED` 表示完成事件没有可识别的成功或错误结构；`CURSOR_IMAGE_MISSING` 表示工具报告成功，但没有有效的内嵌图片数据或本次临时目录中可读取的实际图片文件。新版本从工具事件取回图片，不依赖固定的 generated.png 文件名。
 
@@ -150,3 +150,7 @@ docker compose exec wecom-ai-bot node scripts/diagnose-cursor-image.ts
 原生生图诊断的 `imageTools` 字段包含 GenerateImage 完成事件的状态、结果字段名和脱敏错误正文。普通日志只记录 `imageResults` 的状态与权限关键词标记，不打印工具错误正文；定位失败时应优先看 `imageTools[].error`，不要只凭模型最终解释判断原因。
 
 若旧版出现 `Failed to save generated image ... Blocked by permissions configuration`，更新代码并重建即可使用独立绘图权限配置。无需删除 cursor-state 卷或手工清空共享权限：绘图调用会从已有登录配置创建临时副本，放行本次 assets 输出目录，并在结束后删除副本；聊天仍禁止写入。
+
+模型任务默认超时为 5 分钟：`LLM_TIMEOUT_MS=300000`。`CURSOR_TIMEOUT_MS`、`IMAGE_TIMEOUT_MS`、`SVG_TIMEOUT_MS`、`FILE_TASK_TIMEOUT_MS` 未单独设置时继承该值；已有显式配置仍优先，请删除旧值或统一设为 300000。`UPSTREAM_TIMEOUT_MS` 仅控制微信接口请求，默认仍为 30000。超时按调用阶段计算，API 超时后 Cursor 兜底另有 5 分钟；对话后配图也单独计时，不是整条消息 5 分钟总上限。
+
+文件发送无需新增配置：更新后执行 `bash start.sh docker`，启动会迁移到 schema 3。可以直接说“把骑车的鹈鹕做成完整 HTML 动画文件发给我”。生成的文件每轮最多一个，最多 40000 字符且不超过 200KB；旧对话中“只能打字、不能发送文件”的说法不再适用。

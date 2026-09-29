@@ -2,7 +2,7 @@ import type { BotReply } from './reply-types.ts';
 import { drawingPrompt } from './image-generation.ts';
 import { MessageStore } from './message-store.ts';
 import type { DatabaseConfig, Job } from './message-store.ts';
-import { syncMessages, sendText, sendImage, uploadImage, WecomApiError } from './wecom-api.ts';
+import { syncMessages, sendText, sendImage, uploadImage, sendFile, uploadFileMedia, WecomApiError } from './wecom-api.ts';
 import type { KfMessage, WecomApiConfig } from './wecom-api.ts';
 import { errorCode, retryable } from './http-client.ts';
 import { diagnoseSendFailure } from './send-diagnostics.ts';
@@ -145,20 +145,24 @@ export class MessageWorker {
       for (const part of await this.store.parts(job)) {
         if (part.part > 0) await new Promise((r) => setTimeout(r, 400));
         if (!this.store.healthy) return;
-        if (part.kind === 'image') {
+        if (part.kind === 'image' || part.kind === 'file') {
+          const sendMedia = part.kind === 'file' ? sendFile : sendImage;
           let mediaId = part.media_id;
           const upload = async () => {
-            const id = await uploadImage(this.cfg, Buffer.from(part.content, 'base64'));
+            const bytes = Buffer.from(part.content, 'base64');
+            const id = part.kind === 'file'
+              ? await uploadFileMedia(this.cfg, bytes, part.filename || '')
+              : await uploadImage(this.cfg, bytes);
             // Keep original bytes until send confirmation so expired media can be reuploaded.
             await this.store.setMedia(job, part.part, id, Date.now() + 2 * 86400000);
             return id;
           };
           if (!mediaId || Number(part.media_expires_at) <= Date.now()) mediaId = await upload();
-          try { await sendImage(this.cfg, { touser: user, openKfId: job.kfid, msgid: part.msgid, mediaId }); }
+          try { await sendMedia(this.cfg, { touser: user, openKfId: job.kfid, msgid: part.msgid, mediaId }); }
           catch (error) {
             if (!(error instanceof WecomApiError) || error.errcode !== 40007) throw error;
             mediaId = await upload();
-            await sendImage(this.cfg, { touser: user, openKfId: job.kfid, msgid: part.msgid, mediaId });
+            await sendMedia(this.cfg, { touser: user, openKfId: job.kfid, msgid: part.msgid, mediaId });
           }
         } else {
           await sendText(this.cfg, { touser: user, openKfId: job.kfid, msgid: part.msgid, content: part.content });

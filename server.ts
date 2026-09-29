@@ -47,6 +47,7 @@ export interface Config extends DatabaseConfig {
   maxTurns: number;
   fileMaxMb: number;
   upstreamTimeoutMs: number;
+  llmTimeoutMs: number;
   fileTaskTimeoutMs: number;
   maxConcurrentJobs: number;
   maxQueueSize: number;
@@ -77,17 +78,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (env.CURSOR_FALLBACK && !['true','false'].includes(env.CURSOR_FALLBACK)) throw new Error('CURSOR_FALLBACK 必须为 true 或 false');
   const imageProvider = env.IMAGE_PROVIDER || 'svg';
   if (!['svg', 'cursor'].includes(imageProvider)) throw new Error('IMAGE_PROVIDER 必须为 svg 或 cursor');
+  const modelTimeoutMs = Number(env.LLM_TIMEOUT_MS || 300000);
   const cfg = {
     llmProvider: provider,
     svgProvider,
     cursorFallback: env.CURSOR_FALLBACK === 'true',
     imageProvider,
     cursorImageModel: env.CURSOR_IMAGE_MODEL || env.CURSOR_MODEL || 'auto',
-    nativeImageTimeoutMs: Number(env.IMAGE_TIMEOUT_MS || 180000),
+    nativeImageTimeoutMs: Number(env.IMAGE_TIMEOUT_MS || modelTimeoutMs),
     cursorBin: env.CURSOR_AGENT_BIN || 'cursor-agent',
     cursorStateDir: env.CURSOR_STATE_DIR || './.cursor-agent-state',
     cursorModel: env.CURSOR_MODEL || 'auto',
-    cursorTimeoutMs: Number(env.CURSOR_TIMEOUT_MS || 120000),
+    cursorTimeoutMs: Number(env.CURSOR_TIMEOUT_MS || modelTimeoutMs),
     port: Number(env.PORT || 8788),
     corpId: env.WECOM_CORP_ID,
     kfSecret: env.WECOM_KF_SECRET,
@@ -100,14 +102,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     llmApiKey: env.LLM_API_KEY || '',
     llmModel: env.LLM_MODEL || '',
     imageModel: env.SVG_MODEL || (svgProvider === 'cursor' ? (env.CURSOR_MODEL || 'auto') : env.LLM_MODEL),
-    imageTimeoutMs: Number(env.SVG_TIMEOUT_MS || 120000),
+    imageTimeoutMs: Number(env.SVG_TIMEOUT_MS || modelTimeoutMs),
     llmVisionModel: env.LLM_VISION_MODEL || env.LLM_MODEL, // 看图模型，需支持视觉
     systemPrompt: env.LLM_SYSTEM_PROMPT || '你是一位用户的好朋友，通过微信聊天。回复要口语化、简洁自然，一般不超过 150 字，不用 markdown 格式，分点列表。',
     maxTurns: Number(env.MAX_HISTORY_TURNS || 12),
     fileMaxMb: Number(env.FILE_MAX_MB || 20),
     ...databaseConfig(env),
+    llmTimeoutMs: modelTimeoutMs,
     upstreamTimeoutMs: Number(env.UPSTREAM_TIMEOUT_MS || 30000),
-    fileTaskTimeoutMs: Number(env.FILE_TASK_TIMEOUT_MS || 90000),
+    fileTaskTimeoutMs: Number(env.FILE_TASK_TIMEOUT_MS || modelTimeoutMs),
     maxConcurrentJobs: Number(env.MAX_CONCURRENT_JOBS || 2),
     maxQueueSize: Number(env.MAX_QUEUE_SIZE || 1000),
     dailyRequestLimit: Number(env.DAILY_REQUEST_LIMIT || 100),
@@ -128,7 +131,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length > 0) throw new Error(`缺少配置: ${missing.join(', ')}（参考 .env.example）`);
   for (const key of ['port', 'maxTurns', 'fileMaxMb', 'upstreamTimeoutMs', 'fileTaskTimeoutMs',
-    'imageTimeoutMs', 'nativeImageTimeoutMs', 'cursorTimeoutMs', 'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
+    'llmTimeoutMs', 'imageTimeoutMs', 'nativeImageTimeoutMs', 'cursorTimeoutMs', 'maxConcurrentJobs', 'maxQueueSize', 'dailyRequestLimit', 'syncPollMs', 'retryBaseMs', 'maxSendAttempts', 'retentionDays'] as const) {
     if (!Number.isSafeInteger(cfg[key]) || cfg[key] < 1) throw new Error(`配置 ${key} 必须为正整数`);
   }
   if (cfg.port > 65535) throw new Error('PORT 超出范围');
@@ -308,7 +311,7 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
     if (cfg.llmProvider === 'cursor') return '暂时无法继续处理这个文件，请发送 /reset 开始新对话。';
     const { fileId, filename } = conv.pendingFile;
     const answer = await askFile({
-      timeoutMs: cfg.upstreamTimeoutMs,
+      timeoutMs: cfg.llmTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
       model: cfg.llmModel,
@@ -322,7 +325,7 @@ async function handleText(cfg: Config, store: UserStore, conv: Conversation, con
   const answer = await conversationReply({
     provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
     fallbackCursor: cursorFallback(cfg),
-    timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.upstreamTimeoutMs,
+    timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.llmTimeoutMs,
     baseUrl: cfg.llmBaseUrl,
     apiKey: cfg.llmApiKey,
     model: cfg.llmProvider === 'cursor' ? cfg.cursorModel : cfg.llmModel,
@@ -346,7 +349,7 @@ async function handleImage(cfg: Config, conv: Conversation, msg: KfMessage): Pro
   const dataUri = `data:${mime};base64,${buf.toString('base64')}`;
   const answer = await chatCompletion({
     provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
-    timeoutMs: cfg.upstreamTimeoutMs,
+    timeoutMs: cfg.llmTimeoutMs,
     baseUrl: cfg.llmBaseUrl,
     apiKey: cfg.llmApiKey,
     model: cfg.llmVisionModel,
@@ -384,7 +387,7 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
     const answer = await chatCompletion({
       provider: cfg.llmProvider, cursorBin: cfg.cursorBin, cursorStateDir: cfg.cursorStateDir,
       fallbackCursor: cursorFallback(cfg),
-      timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.upstreamTimeoutMs,
+      timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.llmTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
       model: cfg.llmProvider === 'cursor' ? cfg.cursorModel : cfg.llmModel,
@@ -403,10 +406,10 @@ async function handleFile(cfg: Config, conv: Conversation, msg: KfMessage): Prom
 
   if (DOC_EXT.has(ext)) {
     const signal = AbortSignal.timeout(cfg.fileTaskTimeoutMs);
-    const up = await uploadFile({ signal, timeoutMs: cfg.upstreamTimeoutMs, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, buffer: buf, filename });
+    const up = await uploadFile({ signal, timeoutMs: cfg.llmTimeoutMs, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, buffer: buf, filename });
     await waitFileActive({ signal, timeoutMs: cfg.fileTaskTimeoutMs, baseUrl: cfg.llmBaseUrl, apiKey: cfg.llmApiKey, fileId: up.id });
     const answer = await askFile({
-      timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.upstreamTimeoutMs,
+      timeoutMs: cfg.llmProvider === 'cursor' ? cfg.cursorTimeoutMs : cfg.llmTimeoutMs,
       baseUrl: cfg.llmBaseUrl,
       apiKey: cfg.llmApiKey,
       model: cfg.llmProvider === 'cursor' ? cfg.cursorModel : cfg.llmModel,

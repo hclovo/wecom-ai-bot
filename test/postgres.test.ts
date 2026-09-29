@@ -94,19 +94,39 @@ test('newer migration version rejects startup without resetting jobs', async () 
   const cfg=testDatabase();const store=await MessageStore.open(cfg);const sql=admin(cfg);
   await seed(store,['one']);const job=(await store.nextJobs(1))[0];await store.start(job);await store.close();
   try {
-    await sql.query('INSERT INTO schema_migrations VALUES(3)');
+    await sql.query('INSERT INTO schema_migrations VALUES(4)');
     await assert.rejects(MessageStore.open(cfg),/版本/);
     assert.equal((await sql.query('SELECT status FROM inbox')).rows[0].status,'processing');
   } finally {await sql.end();}
 });
 
-test('version 1 outbox migrates to version 2 without losing pending text replies',async()=>{
+test('version 1 outbox migrates to version 3 without losing pending text replies',async()=>{
   const cfg=testDatabase();let store=await MessageStore.open(cfg);const sql=admin(cfg);
   try{
     await seed(store,['legacy']);const job=(await store.nextJobs(1))[0];await store.saveReply(job,'legacy-session',['old text']);await store.close();
-    await sql.query('ALTER TABLE outbox DROP COLUMN kind, DROP COLUMN media_id, DROP COLUMN media_expires_at; DELETE FROM schema_migrations WHERE version=2;');
+    await sql.query('ALTER TABLE outbox DROP COLUMN kind, DROP COLUMN media_id, DROP COLUMN media_expires_at, DROP COLUMN filename; DELETE FROM schema_migrations WHERE version>=2;');
     store=await MessageStore.open(cfg);const parts=await store.parts(job);
     assert.equal(parts[0].kind,'text');assert.equal(parts[0].content,'old text');assert.equal(await store.session(job.user_key),'legacy-session');
-    assert.equal((await sql.query('SELECT max(version) AS version FROM schema_migrations')).rows[0].version,2);
+    assert.equal((await sql.query('SELECT max(version) AS version FROM schema_migrations')).rows[0].version,3);
   }finally{await store.close();await sql.end();}
+});
+
+test('version 2 migration preserves a pending image and its uploaded media for delivery', async () => {
+  const cfg = testDatabase(); let store = await MessageStore.open(cfg); const sql = admin(cfg);
+  try {
+    await seed(store, ['legacy-image']); const job = (await store.nextJobs(1))[0];
+    await store.saveReply(job, 'image-session', [{ kind: 'image', base64: 'aW1hZ2U=' }]);
+    await store.setMedia(job, 0, 'existing-media', 9999999999999);
+    await store.close();
+    await sql.query(`ALTER TABLE outbox DROP COLUMN filename;
+      ALTER TABLE outbox DROP CONSTRAINT outbox_kind;
+      ALTER TABLE outbox ADD CONSTRAINT outbox_kind CHECK(kind IN ('text','image'));
+      DELETE FROM schema_migrations WHERE version=3;`);
+    store = await MessageStore.open(cfg);
+    const part = (await store.parts(job))[0];
+    assert.equal(part.kind, 'image'); assert.equal(part.content, 'aW1hZ2U=');
+    assert.equal(part.media_id, 'existing-media'); assert.equal(part.filename, null);
+    assert.equal(await store.session(job.user_key), 'image-session');
+    assert.equal((await sql.query('SELECT max(version) AS version FROM schema_migrations')).rows[0].version, 3);
+  } finally { await store.close(); await sql.end(); }
 });
