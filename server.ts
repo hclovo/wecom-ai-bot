@@ -50,6 +50,7 @@ export interface Config extends DatabaseConfig {
   llmTimeoutMs: number;
   fileTaskTimeoutMs: number;
   maxConcurrentJobs: number;
+  progressNoticeMs: number;
   maxQueueSize: number;
   dailyRequestLimit: number;
   syncPollMs: number;
@@ -112,6 +113,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     upstreamTimeoutMs: Number(env.UPSTREAM_TIMEOUT_MS || 30000),
     fileTaskTimeoutMs: Number(env.FILE_TASK_TIMEOUT_MS || modelTimeoutMs),
     maxConcurrentJobs: Number(env.MAX_CONCURRENT_JOBS || 2),
+    progressNoticeMs: Number(env.PROGRESS_NOTICE_MS ?? 3000),
     maxQueueSize: Number(env.MAX_QUEUE_SIZE || 1000),
     dailyRequestLimit: Number(env.DAILY_REQUEST_LIMIT || 100),
     syncPollMs: Number(env.SYNC_POLL_MS || 60000),
@@ -135,6 +137,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     if (!Number.isSafeInteger(cfg[key]) || cfg[key] < 1) throw new Error(`配置 ${key} 必须为正整数`);
   }
   if (cfg.port > 65535) throw new Error('PORT 超出范围');
+  if (!Number.isSafeInteger(cfg.progressNoticeMs) || cfg.progressNoticeMs < 0 || cfg.progressNoticeMs > 2147483647) throw new Error('PROGRESS_NOTICE_MS 必须为非负整数且不超过 2147483647');
   if (!/^\/[a-zA-Z0-9/_-]+$/.test(cfg.mediaPath)) throw new Error('WECOM_MEDIA_PATH 必须是 API 路径');
   if (!/^[A-Za-z0-9+/]{43}$/.test(cfg.aesKey!)) throw new Error('EncodingAESKey 必须为 43 位 Base64 字符');
   if (env.WECOM_AUTO_TAKEOVER && !['true', 'false'].includes(env.WECOM_AUTO_TAKEOVER)) throw new Error('WECOM_AUTO_TAKEOVER 必须为 true 或 false');

@@ -9,6 +9,7 @@ import { diagnoseSendFailure } from './send-diagnostics.ts';
 
 export interface WorkerConfig extends WecomApiConfig, DatabaseConfig { maxConcurrentJobs: number; maxQueueSize: number; dailyRequestLimit: number;
   syncPollMs: number; retryBaseMs: number; maxSendAttempts: number; retentionDays: number;
+  progressNoticeMs?: number;
 }
 export class MessageWorker {
   store: MessageStore;
@@ -120,7 +121,8 @@ export class MessageWorker {
         if (billable && !(await this.store.charge(job, this.cfg.dailyRequestLimit))) {
           result = { chunks: ['今天的使用次数已到上限，明天再聊吧～'] };
         } else {
-          result = await this.handler(msg, await this.store.session(job.user_key));
+          const session = await this.store.session(job.user_key);
+          result = await this.handleWithProgress(job, msg, session, billable);
         }
       } catch {
         // No result was generated; fail visibly rather than loop indefinitely on a corrupt session.
@@ -176,6 +178,34 @@ export class MessageWorker {
       await this.store.defer(job, this.delay(job.attempts), terminal);
       const diagnosis = await diagnoseSendFailure(this.cfg, error, job.kfid, user);
       if (diagnosis) console.error('[send-diagnosis]', diagnosis);
+    }
+  }
+  private async handleWithProgress(job: Job, msg: KfMessage, session: string | undefined, enabled: boolean): Promise<BotReply> {
+    let finished = false;
+    let notice: Promise<void> | undefined;
+    const delay = this.cfg.progressNoticeMs ?? 3000;
+    const timer = enabled && delay > 0 ? setTimeout(() => {
+      if (finished || this.closing || !this.store.healthy) return;
+      notice = (async () => {
+        try {
+          const content = '正在处理，请稍等，完成后会发给你。';
+          const msgid = await this.store.claimProgress(job, content);
+          if (!msgid || finished || this.closing || !this.store.healthy) return;
+          const [, user] = JSON.parse(job.user_key) as [string, string];
+          await sendText({ ...this.cfg, upstreamTimeoutMs: Math.min(this.cfg.upstreamTimeoutMs ?? 30000, 3000) },
+            { touser: user, openKfId: job.kfid, msgid, content });
+          await this.store.markPart(job, -1);
+        } catch (error) { console.error('[progress]', errorCode(error)); }
+      })();
+    }, delay) : undefined;
+    timer?.unref();
+    try { return await this.handler(msg, session); }
+    finally {
+      finished = true;
+      if (timer) clearTimeout(timer);
+      // Finish a notice already in flight before sending the final answer.
+      // This prevents a late "processing" message arriving after the result.
+      await notice;
     }
   }
   async stop(): Promise<void> {

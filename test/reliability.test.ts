@@ -401,6 +401,72 @@ test('saved file attachment survives restart with its filename and no model invo
   finally { await worker.stop(); }
 });
 
+test('progress is silent for fast tasks, sent once for slow tasks and never arrives after the answer', async t => {
+  clearTokenCache(); const sent: string[] = [];
+  let finishModel!: () => void, finishNotice!: () => void;
+  const model = new Promise<void>(resolve => { finishModel = resolve; });
+  const notice = new Promise<void>(resolve => { finishNotice = resolve; });
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    const body = JSON.parse(String(init?.body)); sent.push(body.text.content);
+    if (body.text.content.includes('正在处理')) await notice;
+    return Response.json({ errcode: 0 });
+  });
+  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 40 }, async message => {
+    if (message.msgid === 'slow') await model;
+    return { chunks: [`结果:${message.msgid}`] };
+  });
+  try {
+    await add(worker.store, [msg('fast')]); worker.start();
+    await until(async () => await worker.store.pendingCount() === 0);
+    assert.deepEqual(sent, ['结果:fast']);
+    await add(worker.store, [msg('slow')]);
+    await until(() => sent.some(s => s.includes('正在处理')));
+    finishModel(); await sleep(30);
+    assert.ok(!sent.includes('结果:slow'));
+    finishNotice();
+    await until(async () => await worker.store.pendingCount() === 0);
+    assert.deepEqual(sent, ['结果:fast', '正在处理，请稍等，完成后会发给你。', '结果:slow']);
+  } finally { finishModel(); finishNotice(); await worker.stop(); }
+});
+
+test('failed progress delivery does not fail the task or enter final-reply retries', async t => {
+  clearTokenCache(); const sent: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    const text = JSON.parse(String(init?.body)).text.content; sent.push(text);
+    return text.includes('正在处理') ? new Response('', { status: 503 }) : Response.json({ errcode: 0 });
+  });
+  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 20 }, async () => {
+    await sleep(100); return { chunks: ['完成'] };
+  });
+  try {
+    await add(worker.store, [msg('progress-error')]); worker.start();
+    await until(async () => await worker.store.pendingCount() === 0);
+    assert.deepEqual(sent, ['正在处理，请稍等，完成后会发给你。', '完成']);
+  } finally { await worker.stop(); }
+});
+
+test('progress reservation survives restart and commands never receive progress notices', async t => {
+  const db = testDatabase(); const store = await MessageStore.open(db);
+  await add(store, [msg('recovered')]); const job = (await store.nextJobs(1))[0];
+  await store.start(job); assert.ok(await store.claimProgress(job, '正在处理'));
+  assert.equal(await store.claimProgress(job, '正在处理'), undefined);
+  await store.close();
+  clearTokenCache(); const sent: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    sent.push(JSON.parse(String(init?.body)).text.content); return Response.json({ errcode: 0 });
+  });
+  const worker = await MessageWorker.create({ ...cfg, ...db, progressNoticeMs: 20 }, async () => { await sleep(80); return { chunks: ['完成'] }; });
+  try {
+    worker.start(); await until(async () => await worker.store.pendingCount() === 0);
+    await add(worker.store, [msg('command', 'user', '/help')]);
+    await until(async () => await worker.store.pendingCount() === 0);
+    assert.deepEqual(sent, ['完成', '完成']);
+  } finally { await worker.stop(); }
+});
+
 test('saved generated image survives restart and refreshes expired media without a model call',async(t)=>{
   const dbConfig=testDatabase();const store=await MessageStore.open(dbConfig);
   const {renderSvg}=await import('../lib/image-generation.ts');
