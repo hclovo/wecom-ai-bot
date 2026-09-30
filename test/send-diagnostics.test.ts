@@ -37,6 +37,15 @@ test('unrelated errors do not trigger diagnosis requests', async (t) => {
   assert.equal(fetchMock.mock.callCount(), 0);
 });
 
+test('95001 explains the shared message allowance without querying or exposing provider details', async t => {
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () => { throw new Error('must not query'); });
+  const result = await diagnoseSendFailure(cfg, new WecomApiError('send_msg', { errcode: 95001, errmsg: 'PRIVATE' }), 'kf', 'user');
+  assert.match(result!, /回复次数已用尽/);
+  assert.match(result!, /无需重新生成/);
+  assert.ok(!result!.includes('PRIVATE'));
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
 test('query errors and malformed states stay diagnostic-only and never expose remote content', async (t) => {
   clearTokenCache();
   let reply: unknown;

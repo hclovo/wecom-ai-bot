@@ -3,6 +3,7 @@ import type { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { createHash } from 'node:crypto';
 import type { ReplyChunk } from './reply-types.ts';
 import type { KfMessage } from './wecom-api.ts';
+import { fitReplyBudget, MAX_INTERMEDIATE_MESSAGES, MAX_REPLY_MESSAGES } from './reply-budget.ts';
 
 export interface DatabaseConfig {
   databaseUrl: string;
@@ -204,22 +205,30 @@ export class MessageStore {
       return true;
     });
   }
-  async saveReply(job: Job, session: string | undefined, chunks: ReplyChunk[]): Promise<void> {
-    await this.transaction(async (client) => {
+  async saveReply(job: Job, session: string | undefined, chunks: ReplyChunk[]): Promise<boolean> {
+    return this.transaction(async (client) => {
       const row = await client.query('SELECT status FROM inbox WHERE id=$1 FOR UPDATE', [job.id]);
       if (!row.rows.length) throw new Error('消息任务不存在');
       // COMMIT may succeed while its network acknowledgement is lost. Repeating this
       // transaction must not duplicate parts or overwrite a later session snapshot.
-      if (['reply_ready', 'sent', 'failed'].includes(row.rows[0].status)) return;
+      if (['reply_ready', 'sent', 'failed'].includes(row.rows[0].status)) return row.rows[0].status !== 'failed';
+      const attempts = await client.query('SELECT count(*)::integer AS count FROM outbox WHERE job_id=$1 AND part<0', [job.id]);
+      const slots = MAX_REPLY_MESSAGES - attempts.rows[0].count;
+      // Retain legacy over-budget results for manual recovery; new processing
+      // can reserve at most two intermediate messages, leaving >=3 final slots.
+      let finalChunks = chunks, sendable = slots > 0;
+      try { if (sendable) finalChunks = fitReplyBudget(chunks, slots); }
+      catch { sendable = false; }
       if (session !== undefined) await client.query('INSERT INTO sessions VALUES($1,$2,$3) ON CONFLICT(user_key) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at',
         [job.user_key, session, Date.now()]);
-      for (const [part, chunk] of chunks.entries()) {
+      for (const [part, chunk] of finalChunks.entries()) {
         const kind = typeof chunk === 'string' ? 'text' : chunk.kind;
         const content = typeof chunk === 'string' ? chunk : chunk.base64;
         const msgid = createHash('sha256').update(JSON.stringify([job.kfid, job.msgid, part])).digest('hex').slice(0, 32);
         await client.query('INSERT INTO outbox(job_id,part,msgid,content,kind,filename) VALUES($1,$2,$3,$4,$5,$6)', [job.id, part, msgid, content, kind, typeof chunk !== 'string' && chunk.kind === 'file' ? chunk.filename : null]);
       }
-      await client.query("UPDATE inbox SET status=$1,attempts=0,next_at=0,payload='{}' WHERE id=$2", [chunks.length ? 'reply_ready' : 'sent', job.id]);
+      await client.query("UPDATE inbox SET status=$1,attempts=0,next_at=0,payload='{}' WHERE id=$2", [finalChunks.length ? (sendable ? 'reply_ready' : 'failed') : 'sent', job.id]);
+      return sendable;
     });
   }
   async parts(job: Job): Promise<ReplyPart[]> {
@@ -230,14 +239,22 @@ export class MessageStore {
   async claimProgress(job: Job, content: string, sequence = 1, publicText = false): Promise<string | undefined> {
     const part = -(sequence * 2 - (publicText ? 0 : 1));
     const msgid = createHash('sha256').update(JSON.stringify([job.kfid, job.msgid, 'progress', part])).digest('hex').slice(0, 32);
-    const result = await this.query(`INSERT INTO outbox(job_id,part,msgid,content,kind)
-      SELECT id,$4,$2,$3,'text' FROM inbox WHERE id=$1 AND status='processing'
-      ON CONFLICT(job_id,part) DO NOTHING RETURNING msgid`, [job.id, msgid, content, part]);
-    return result.rows[0]?.msgid;
+    return this.transaction(async client => {
+      await client.query('SELECT id FROM inbox WHERE id=$1 FOR UPDATE', [job.id]);
+      const result = await client.query(`INSERT INTO outbox(job_id,part,msgid,content,kind)
+        SELECT id,$4,$2,$3,'text' FROM inbox WHERE id=$1 AND status='processing'
+        AND (SELECT count(*) FROM outbox WHERE job_id=$1 AND part<0)<$5
+        ON CONFLICT(job_id,part) DO NOTHING RETURNING msgid`, [job.id, msgid, content, part, MAX_INTERMEDIATE_MESSAGES]);
+      return result.rows[0]?.msgid;
+    });
   }
   async progressText(job: Job): Promise<string> {
     const rows = await this.query<{content: string}>('SELECT content FROM outbox WHERE job_id=$1 AND part<0 AND part % 2=0 AND sent=1 ORDER BY part DESC', [job.id]);
     return rows.rows.map(row => row.content).join('');
+  }
+  async progressAttempts(job: Job): Promise<number> {
+    const result = await this.query('SELECT count(*)::integer AS count FROM outbox WHERE job_id=$1 AND part<0', [job.id]);
+    return result.rows[0].count;
   }
   async markProgress(job: Job, sequence: number, publicText: boolean): Promise<void> {
     const part = -(sequence * 2 - (publicText ? 0 : 1));

@@ -401,7 +401,7 @@ test('saved file attachment survives restart with its filename and no model invo
   finally { await worker.stop(); }
 });
 
-test('progress is silent for fast tasks, sent once for slow tasks and never arrives after the answer', async t => {
+test('only useful intermediate content is sent and never arrives after the answer', async t => {
   clearTokenCache(); const sent: string[] = [];
   let finishModel!: () => void, finishNotice!: () => void;
   const model = new Promise<void>(resolve => { finishModel = resolve; });
@@ -409,11 +409,11 @@ test('progress is silent for fast tasks, sent once for slow tasks and never arri
   t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
     if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
     const body = JSON.parse(String(init?.body)); sent.push(body.text.content);
-    if (body.text.content.includes('正在处理')) await notice;
+    if (body.text.content.includes('订单已核对')) await notice;
     return Response.json({ errcode: 0 });
   });
-  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 40 }, async message => {
-    if (message.msgid === 'slow') await model;
+  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 40 }, async (message, _session, progress) => {
+    if (message.msgid === 'slow') { progress.text('订单已核对。'); await model; return { chunks: ['订单已核对。', '结果:slow'] }; }
     return { chunks: [`结果:${message.msgid}`] };
   });
   try {
@@ -421,12 +421,12 @@ test('progress is silent for fast tasks, sent once for slow tasks and never arri
     await until(async () => await worker.store.pendingCount() === 0);
     assert.deepEqual(sent, ['结果:fast']);
     await add(worker.store, [msg('slow')]);
-    await until(() => sent.some(s => s.includes('正在处理')));
+    await until(() => sent.some(s => s.includes('订单已核对')));
     finishModel(); await sleep(30);
     assert.ok(!sent.includes('结果:slow'));
     finishNotice();
     await until(async () => await worker.store.pendingCount() === 0);
-    assert.deepEqual(sent, ['结果:fast', '正在处理，请稍等，完成后会发给你。', '结果:slow']);
+    assert.deepEqual(sent, ['结果:fast', '订单已核对。', '结果:slow']);
   } finally { finishModel(); finishNotice(); await worker.stop(); }
 });
 
@@ -435,15 +435,15 @@ test('failed progress delivery does not fail the task or enter final-reply retri
   t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
     if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
     const text = JSON.parse(String(init?.body)).text.content; sent.push(text);
-    return text.includes('正在处理') ? new Response('', { status: 503 }) : Response.json({ errcode: 0 });
+    return text.includes('订单已核对') ? new Response('', { status: 503 }) : Response.json({ errcode: 0 });
   });
-  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 20 }, async () => {
-    await sleep(100); return { chunks: ['完成'] };
+  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 20 }, async (_msg, _session, progress) => {
+    progress.text('订单已核对。'); await sleep(100); return { chunks: ['完成'] };
   });
   try {
     await add(worker.store, [msg('progress-error')]); worker.start();
     await until(async () => await worker.store.pendingCount() === 0);
-    assert.deepEqual(sent, ['正在处理，请稍等，完成后会发给你。', '完成']);
+    assert.deepEqual(sent, ['订单已核对。', '完成']);
   } finally { await worker.stop(); }
 });
 
@@ -467,21 +467,22 @@ test('progress reservation survives restart and commands never receive progress 
   } finally { await worker.stop(); }
 });
 
-test('new activity produces more than two progress notices without a fixed count cap', async t => {
+test('intermediate replies stop at two and remaining public text is delivered in the final answer', async t => {
   clearTokenCache(); const sent: string[] = [];
   t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
     if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
     sent.push(JSON.parse(String(init?.body)).text.content); return Response.json({ errcode: 0 });
   });
   const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 10, progressIntervalMs: 20 }, async (_msg, _session, progress) => {
-    const timer = setInterval(() => progress.activity('image'), 10);
-    try { await until(() => sent.length >= 4); return { chunks: ['完成'] }; }
-    finally { clearInterval(timer); }
+    let text = '';
+    for (let i = 1; i <= 2; i++) { text += `第${i}部分。`; progress.text(text); await until(() => sent.length >= i); }
+    text += '第3部分。第4部分。'; progress.text(text); await sleep(100); assert.equal(sent.length, 2);
+    return { chunks: [text, '完成'] };
   });
   try {
     await add(worker.store, [msg('long-active')]); worker.start();
     await until(async () => await worker.store.pendingCount() === 0);
-    assert.ok(sent.length >= 5); assert.equal(sent.at(-1), '完成');
+    assert.deepEqual(sent, ['第1部分。', '第2部分。', '第3部分。第4部分。', '完成']);
   } finally { await worker.stop(); }
 });
 
@@ -514,6 +515,7 @@ test('channel refusal stops progress attempts but generation and final delivery 
     return Response.json(text === '完成' ? { errcode: 0 } : { errcode: 45009 });
   });
   const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 10, progressIntervalMs: 20 }, async (_msg, _session, progress) => {
+    progress.text('订单已核对。');
     const timer = setInterval(() => progress.activity(), 10);
     try { await sleep(120); return { chunks: ['完成'] }; } finally { clearInterval(timer); }
   });
@@ -542,4 +544,28 @@ test('saved generated image survives restart and refreshes expired media without
   const worker=await MessageWorker.create({...cfg,...dbConfig},async()=>{models++;return{chunks:['unexpected']};});
   try{worker.start();await until(async()=>await worker.store.pendingCount()===0);assert.equal(models,0);assert.equal(uploads,1);assert.equal(sends,2);}
   finally{await worker.stop();}
+});
+
+
+test('activity and stage changes never produce acknowledgements or empty status replies', async t => {
+  clearTokenCache(); const sent: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).includes('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });
+    sent.push(JSON.parse(String(init?.body)).text.content); return Response.json({ errcode: 0 });
+  });
+  const worker = await MessageWorker.create({ ...cfg, ...testDatabase(), progressNoticeMs: 10, progressIntervalMs: 20 }, async (_msg, _session, progress) => {
+    let stage: 'reply' | 'image' = 'reply';
+    const timer = setInterval(() => progress.activity(stage), 5);
+    try {
+      await sleep(100); assert.equal(sent.length, 0);
+      stage = 'image'; progress.activity(stage);
+      progress.text('正在生成图片，请稍等。'); await sleep(100); assert.equal(sent.length, 0);
+      return { chunks: ['完成'] };
+    } finally { clearInterval(timer); }
+  });
+  try {
+    await add(worker.store, [msg('no-boilerplate')]); worker.start();
+    await until(async () => await worker.store.pendingCount() === 0);
+    assert.deepEqual(sent, ['完成']);
+  } finally { await worker.stop(); }
 });

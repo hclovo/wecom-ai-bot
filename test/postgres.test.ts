@@ -130,3 +130,22 @@ test('version 2 migration preserves a pending image and its uploaded media for d
     assert.equal((await sql.query('SELECT max(version) AS version FROM schema_migrations')).rows[0].version, 3);
   } finally { await store.close(); await sql.end(); }
 });
+
+test('the five-message budget survives restart and preserves long final text plus two attachments', async () => {
+  const cfg = testDatabase(); let store = await MessageStore.open(cfg); const sql = admin(cfg);
+  try {
+    await seed(store, ['budget']); const job = (await store.nextJobs(1))[0]; await store.start(job);
+    const claims = await Promise.all([1, 2, 3].map(i => store.claimProgress(job, `结果${i}。`, i, true)));
+    assert.equal(claims.filter(Boolean).length, 2);
+    assert.equal(await store.progressAttempts(job), 2);
+    await store.close(); store = await MessageStore.open(cfg); await store.start(job);
+    assert.equal(await store.claimProgress(job, '不能增加第三条', 4, true), undefined);
+    const text = '长结果😀'.repeat(1500);
+    assert.equal(await store.saveReply(job, 'session', [text, { kind: 'image', base64: 'image' },
+      { kind: 'file', filename: '动画.html', base64: 'html' }]), true);
+    const parts = await store.parts(job); assert.equal(parts.length, 3);
+    assert.equal(parts[0].filename, '回复内容.txt');
+    assert.equal(Buffer.from(parts[0].content, 'base64').toString('utf8'), text);
+    assert.equal((await sql.query('SELECT count(*)::integer AS n FROM outbox')).rows[0].n, 5);
+  } finally { await store.close(); await sql.end(); }
+});

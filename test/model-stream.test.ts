@@ -48,12 +48,15 @@ test('SSE keepalives do not prevent an idle timeout and a truncated answer is re
   await assert.rejects(chatCompletion(options), /不完整/);
 });
 
-test('only the completed public text JSON field is exposed, not file source or reasoning', () => {
-  assert.equal(publicReplyText('{"text":"你好'), undefined);
+test('public text is decoded incrementally without exposing file source, reasoning or incomplete escapes', () => {
+  assert.equal(publicReplyText('{"text":"你好'), '你好');
   assert.equal(publicReplyText('{"text":"你好\\n世界","files":[{"content":"PRIVATE_SOURCE'), '你好\n世界');
   assert.equal(publicReplyText('{"reasoning":"PRIVATE_THOUGHT"}'), undefined);
   assert.equal(publicReplyText('<svg>PRIVATE_SOURCE</svg>'), undefined);
-  assert.equal(publicReplyText('{"text":"\\u4f'), undefined);
+  assert.equal(publicReplyText('{"text":"\\u4f'), '');
+  assert.equal(publicReplyText('{"text":"前缀\\uD83D'), '前缀');
+  assert.equal(publicReplyText('{"text":"前缀\\uD83D\\uDE00'), '前缀😀');
+  assert.equal(publicReplyText('{"text":"正文\\'), '正文');
 });
 
 test('Responses file answers also use streaming idle deadlines', async t => {

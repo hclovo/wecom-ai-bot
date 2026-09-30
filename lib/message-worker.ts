@@ -1,5 +1,5 @@
-import { textPrefix } from './task-progress.ts';
-import type { TaskProgress, ProgressStage } from './task-progress.ts';
+import type { TaskProgress } from './task-progress.ts';
+import { MAX_INTERMEDIATE_MESSAGES, intermediateContent } from './reply-budget.ts';
 import type { BotReply } from './reply-types.ts';
 import { drawingPrompt } from './image-generation.ts';
 import { MessageStore } from './message-store.ts';
@@ -135,7 +135,12 @@ export class MessageWorker {
       let blocked = false;
       try {
         while (true) {
-          try { await this.store.saveReply(job, result.session, result.chunks); break; }
+          try {
+            if (!(await this.store.saveReply(job, result.session, result.chunks))) {
+              console.error('[send]', 'REPLY_BUDGET_EXHAUSTED', 'FAILED'); return;
+            }
+            break;
+          }
           catch {
             if (!blocked) { this.pendingWrites++; blocked = true; console.error('[worker]', 'REPLY_STORAGE_UNAVAILABLE'); }
             if (this.closing || !this.store.healthy) return; // processing remains durable for restart recovery
@@ -183,45 +188,45 @@ export class MessageWorker {
     }
   }
   private async handleWithProgress(job: Job, msg: KfMessage, session: string | undefined, enabled: boolean): Promise<BotReply> {
-    let finished = false, blocked = false, sequence = 0, version = 0, reported = -1;
-    let stage: ProgressStage = 'reply', publicText = '';
+    let finished = false, blocked = false, sequence = 0;
+    let publicText = '';
+    let attempts = await this.store.progressAttempts(job);
     let sentText = await this.store.progressText(job);
     let notice: Promise<void> | undefined, timer: ReturnType<typeof setTimeout> | undefined;
     const firstDelay = this.cfg.progressNoticeMs ?? 3000;
     const interval = this.cfg.progressIntervalMs ?? 30000;
     const progress: TaskProgress = {
-      activity: next => { version++; if (next) stage = next; },
-      text: value => { if (value !== publicText) { publicText = value; version++; } },
+      activity: () => {}, // Transport liveness still refreshes model idle timeouts.
+      text: value => { publicText = value; },
     };
     const tick = () => {
-      if (finished || blocked || this.closing || !this.store.healthy) return;
+      if (finished || blocked || attempts >= MAX_INTERMEDIATE_MESSAGES || this.closing || !this.store.healthy) return;
       notice = (async () => {
         try {
           const pending = publicText.startsWith(sentText) ? publicText.slice(sentText.length) : '';
-          if (!pending && version === reported) return;
-          const content = pending ? textPrefix(pending) : stage === 'image' ? '正在生成图片，请稍等。'
-            : stage === 'file' ? '正在处理文件，请稍等。'
-            : reported < 0 ? '正在处理，请稍等，完成后会发给你。' : '仍在整理回复，请稍等。';
-          const publicPart = !!pending;
+          const content = intermediateContent(pending);
+          if (!content) return;
+          const publicPart = true;
           const attempt = ++sequence;
-          const observed = version;
           const msgid = await this.store.claimProgress(job, content, attempt, publicPart);
-          if (!msgid || finished || this.closing || !this.store.healthy) { reported = observed; return; }
+          attempts = await this.store.progressAttempts(job);
+          if (!msgid || finished || this.closing || !this.store.healthy) {
+            return;
+          }
           const [, user] = JSON.parse(job.user_key) as [string, string];
           await sendText({ ...this.cfg, upstreamTimeoutMs: Math.min(this.cfg.upstreamTimeoutMs ?? 30000, 3000) },
             { touser: user, openKfId: job.kfid, msgid, content });
           // Track delivery before the database write: a storage fault must not cause
           // the same public prefix to be sent again within this execution.
-          if (publicPart) sentText += content;
-          reported = observed;
+          sentText += content;
           await this.store.markProgress(job, attempt, publicPart);
         } catch (error) {
           console.error('[progress]', errorCode(error));
           // Channel refusal stops notices, not generation or final delivery.
-          if (error instanceof WecomApiError) blocked = true;
+          blocked = true;
         }
       })().finally(() => {
-        if (!finished && !blocked && !this.closing) { timer = setTimeout(tick, interval); timer.unref(); }
+        if (!finished && !blocked && attempts < MAX_INTERMEDIATE_MESSAGES && !this.closing) { timer = setTimeout(tick, interval); timer.unref(); }
       });
     };
     if (enabled && firstDelay > 0) { timer = setTimeout(tick, firstDelay); timer.unref(); }

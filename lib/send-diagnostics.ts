@@ -13,6 +13,9 @@ const stateHints = [
 // Return only fixed text and validated codes, never upstream bodies or customer identifiers.
 // This is a snapshot taken AFTER the failure, not proof of the state at send time.
 export async function diagnoseSendFailure(cfg: WecomApiConfig, error: unknown, openKfId: string, user: string): Promise<string | undefined> {
+  if (error instanceof WecomApiError && error.errcode === 95001) {
+    return 'WECOM_95001 微信客服回复次数已用尽；中间消息与最终结果共用发送额度。请用户再次发送消息，再重发已保存的失败任务；无需重新生成。';
+  }
   if (!(error instanceof WecomApiError) || error.errcode !== 95018) return undefined;
   try {
     const state = await getServiceState({ ...cfg, upstreamTimeoutMs: Math.min(cfg.upstreamTimeoutMs ?? 30000, 3000) }, openKfId, user);
