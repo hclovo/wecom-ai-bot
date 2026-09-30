@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { textFileReply } from '../lib/file-reply.ts';
 import { conversationReply, parseConversationReply } from '../lib/conversation-reply.ts';
 import { clearTokenCache, uploadFileMedia, sendFile } from '../lib/wecom-api.ts';
+import { fitReplyBudget } from '../lib/reply-budget.ts';
 
 const html = '<!doctype html><html lang="zh"><meta charset="UTF-8"><title>骑车的鹈鹕</title><script>document.body.dataset.ready="yes"</script></html>';
 
@@ -53,4 +54,29 @@ test('file upload retains filename and bytes, refreshes token, and sends a file 
   const mediaId = await uploadFileMedia(cfg, Buffer.from(html), '骑车的鹈鹕.html');
   await sendFile(cfg, { touser: 'u', openKfId: 'kf', msgid: 'stable-file-id', mediaId });
   assert.equal(tokens, 2); assert.equal(uploads, 2);
+});
+
+test('explicit HTML requests recover source from raw text, code fences or mislabeled TXT attachments', async t => {
+  let output = '';
+  const streamed: string[] = [];
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ choices: [{ message: { content: output } }] }));
+  const options = { baseUrl: 'https://model.test', apiKey: 'test', model: 'test', systemPrompt: 'test',
+    history: [{ role: 'user' as const, content: '生成骑车的鹈鹕HTML动画文件' }], onText: (text: string) => streamed.push(text) };
+  const draw = async (): Promise<never> => { throw new Error('must not draw'); };
+  for (output of [html, `\`\`\`html\n${html}\n\`\`\``,
+    JSON.stringify({ text: html, image_prompt: null, files: [] }),
+    JSON.stringify({ text: '', image_prompt: null, files: [{ filename: '鹈鹕.html.txt', content: html }] })]) {
+    const result = await conversationReply(options, draw);
+    const chunks = fitReplyBudget(result.chunks, 3);
+    assert.equal(chunks.length, 1);
+    const file = chunks[0]; assert.ok(typeof file !== 'string' && file.kind === 'file');
+    assert.match(file.filename, /\.html$/); assert.equal(Buffer.from(file.base64, 'base64').toString('utf8'), html);
+  }
+  assert.deepEqual(streamed, []);
+  output = JSON.stringify({ text: '', image_prompt: null, files: [{ filename: 'source.txt', content: html }] });
+  const txt = await conversationReply({ ...options, history: [{ role: 'user', content: '把HTML源码保存为 source.txt' }] }, draw);
+  assert.ok(typeof txt.chunks[0] !== 'string' && txt.chunks[0].kind === 'file');
+  assert.equal(txt.chunks[0].filename, 'source.txt');
+  output = JSON.stringify({ text: '', image_prompt: null, files: [{ filename: 'page.txt', content: '这里只是说明，没有HTML源码' }] });
+  await assert.rejects(conversationReply(options, draw), /HTML/);
 });

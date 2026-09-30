@@ -167,3 +167,5 @@ docker compose exec wecom-ai-bot node scripts/diagnose-cursor-image.ts
 若上游忽略 stream 参数并只在完成时返回 JSON，程序无法观察其内部进度，等待期间仍可能触发无输出超时。已有 .env 中显式设置的旧超时值需改为 600000 或删除后使用新默认值。
 
 若出现 `[send] WECOM_95001 FAILED`，表示微信客服回复条数已用尽，中间消息也占用额度。让该用户再次发消息后，用 `node scripts/status.ts` 查找失败任务 ID，再执行 `node scripts/retry-failed.ts <任务ID>` 重发已保存的剩余结果。Docker 下在两条命令前加 `docker compose exec wecom-ai-bot`。重发不会重新调用模型，已确认发送的部分不会重复发送。新版本已为最终结果预留额度；需要展示不限次数的实时进度时，应使用网页等其他通道。
+
+明确要求 HTML 文件时，会在消息条数打包前识别完整 HTML 文档，支持从正文、HTML 代码块和误命名为 TXT 的附件恢复为 .html/.htm；HTML 源码不会作为中间聊天片段提前发送。普通长说明仍可转为 TXT；明确要求 source.txt 等文本文件时保留用户指定格式。只有解释文字而没有 HTML 源码时，不会直接改后缀伪装成网页。

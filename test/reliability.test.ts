@@ -337,7 +337,7 @@ console.log(JSON.stringify({type:'result',result:'完成'}));
 test('HTML attachment sends after text, refreshes expired media, retries without regeneration and clears delivered content', async t => {
   clearTokenCache(); let models = 0, uploads = 0, sends = 0, texts = 0;
   const ids: string[] = [];
-  const html = '<!doctype html><meta charset="utf-8"><h1>骑车的鹈鹕</h1>';
+  const html = '<!doctype html><html><meta charset="utf-8"><h1>骑车的鹈鹕</h1></html>';
   t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
     const parsed = new URL(String(url));
     if (parsed.pathname.endsWith('/gettoken')) return Response.json({ errcode: 0, access_token: 'token', expires_in: 7200 });

@@ -2,9 +2,10 @@ import { chatCompletion } from './llm.ts';
 import type { ChatOptions } from './llm.ts';
 import type { ImageReply, FileReply, ReplyChunk } from './reply-types.ts';
 import { errorCode } from './http-client.ts';
-import { textFileReply } from './file-reply.ts';
+import { textFileReply, extractHtmlDocument } from './file-reply.ts';
 
 const REPLY_FORMAT = `回复格式：只输出 JSON 对象 {"text":"给用户的文字回复","image_prompt":null,"files":[]}，text 必须是第一个字段，不要 Markdown 代码围栏。text 会先展示给用户，只包含可直接发送的答复，不包含内部思考过程、模型或工具信息。
+用户明确指定文件格式时必须保持该格式：HTML 必须作为 .html 或 .htm 附件，完整源码放 files[].content，不能放进 text，也不能改成 .txt。HTML 文件应含完整 HTML 文档及结束标签，不要用解释文字代替源码。
 每轮包括最终结果在内最多发送5条消息，图片和文件各占1条。中间只输出已经完成、有信息量的内容，最多2段，为最终结果预留位置。不要输出首次确认、寒暄或等待话术，例如“收到”“我先看看”“我来处理”“正在生成”“请稍等”。没有实际中间结果就等到完成再回复，不必凑消息数。答案很长时整理成文件，不要拆成大量聊天消息；仅需附件时 text 可以为空。
 你可以生成并发送真正的文件附件。用户要求 HTML、文本或代码文件，或要求把之前的内容发成文件时，files 填 [{"filename":"名称.html","content":"完整文件内容"}]，系统会上传并发送文件。不要再说只能打字、不能发文件，不要让用户自己复制另存，不要被历史中的旧能力说明误导。每轮最多一个文件，内容最多40000字符且不超过200KB。支持 html/htm/txt/md/csv/json/svg/css/js/ts/py/xml/yaml/yml；不支持生成 PDF、Office 或其他二进制附件，不得用文本伪装这些格式。HTML 使用 UTF-8，尽量包含完整样式与脚本，避免依赖外部资源。文件内容放在 content 中，不重复粘贴到 text；没有附件时 files 为 []。生成的代码只作为文件发送，系统不会执行。
 用户要求图片，或示意图、流程图、图表、简单插画能明显帮助说明时，将 image_prompt 设为完整、独立的中文绘图描述（最多4000字符），系统会绘图并作为真正的图片附件发送。无需用户使用 /draw。根据上下文理解“画出来”“配张图”等追问。
@@ -56,11 +57,46 @@ export function publicReplyText(raw: string): string | undefined {
   return text.trim();
 }
 
+function wantsHtmlFile(options: ChatOptions): boolean {
+  const messages = options.history.filter(message => message.role === 'user' && typeof message.content === 'string');
+  const last = String(messages.at(-1)?.content || '');
+  const namedExtensions = [...last.matchAll(/\.(html?|txt|md|json|csv)\b/gi)];
+  if (namedExtensions.length && !/^html?$/i.test(namedExtensions.at(-1)![1])) return false;
+  if (/(?:保存为|改成|改为|转成|转换成)\s*(?:txt|文本)(?:文件|格式)?/i.test(last)) return false;
+  if (/\.(?:txt|md|json|csv)\b|(?:文本|Markdown)文件/i.test(last) && !/\bhtml?\b/i.test(last)) return false;
+  const requested = (text: string) => /\bhtml?\b|网页/i.test(text) && /生成|制作|创建|写|做|发|保存|导出|文件|动画|页面|网页|修改|改成/i.test(text);
+  if (requested(last)) return !/(?:不要|不用|别)(?:生成|发|做)?(?:HTML|html|网页)/.test(last);
+  return /发给我|发文件|保存|导出|继续|修改/.test(last) && messages.slice(-4, -1).some(message => requested(String(message.content)));
+}
+
+function normalizeHtmlReply(reply: ReturnType<typeof parseConversationReply>): void {
+  if (reply.files.length) {
+    const file = reply.files[0];
+    const doc = extractHtmlDocument(Buffer.from(file.base64, 'base64').toString('utf8'));
+    if (!doc) throw new Error('未生成完整 HTML 文件');
+    const base = file.filename.replace(/\.[^.]+$/, '');
+    const filename = /\.html?$/i.test(file.filename) ? file.filename : /\.html?$/i.test(base) ? base : `${base}.html`;
+    reply.files = [textFileReply(filename, doc.html)];
+    // Models sometimes duplicate the file source in the public text field.
+    const duplicate = extractHtmlDocument(reply.text);
+    if (duplicate) reply.text = duplicate.remainder;
+    return;
+  }
+  const doc = extractHtmlDocument(reply.text);
+  if (!doc) throw new Error('未生成完整 HTML 文件');
+  reply.files = [textFileReply('页面.html', doc.html)];
+  reply.text = doc.remainder;
+}
+
 export async function conversationReply(options: ChatOptions, draw: (prompt: string) => Promise<ImageReply>, mode: 'native' | 'svg' = 'svg'): Promise<{ chunks: ReplyChunk[]; historyText: string }> {
+  const htmlFile = wantsHtmlFile(options);
   const capability = mode === 'native' ? '配图使用原生图片生成工具，可生成插画、写实风格图片等。' : '配图使用 SVG 渲染，只支持示意图、图表、简单插画，不支持照片级效果。';
   const reply = parseConversationReply(await chatCompletion({ ...options, systemPrompt: `${options.systemPrompt}\n\n${REPLY_FORMAT}\n${capability}`,
-    onText: raw => { const text = publicReplyText(raw); if (text !== undefined) options.onText?.(text); },
+    // Keep HTML intact until the artifact is validated; do not send source fragments
+    // early and then remove them from the eventual file as an already-sent prefix.
+    onText: raw => { const text = publicReplyText(raw); if (!htmlFile && text !== undefined) options.onText?.(text); },
   }));
+  if (htmlFile) normalizeHtmlReply(reply);
   const chunks: ReplyChunk[] = reply.text ? [reply.text] : [];
   let historyText = reply.text;
   for (const file of reply.files) {
